@@ -35,15 +35,19 @@ def capture_default_policy(paths: AppPaths) -> None:
         shutil.copy2(source, paths.default_policy_cache)
 
 
-def run_initial_setup(paths: AppPaths, log_path: Path, skip_upgrade: bool = False) -> CommandResult:
+def build_initial_setup_script(skip_upgrade: bool = False) -> str:
     setup_lines = [
         "set -e",
+        "export DEBIAN_FRONTEND=noninteractive",
         "sudo apt update",
         "sudo apt install -y software-properties-common curl git python3-pip python3-venv lsb-release tmux",
         "sudo add-apt-repository -y universe",
         "sudo apt update && sudo apt install -y curl",
-        "export ROS_APT_SOURCE_VERSION=$(curl -s https://api.github.com/repos/ros-infrastructure/ros-apt-source/releases/latest | grep -F 'tag_name' | awk -F\\\" '{print $4}')",
-        "curl -L -o /tmp/ros2-apt-source.deb \"https://github.com/ros-infrastructure/ros-apt-source/releases/download/${ROS_APT_SOURCE_VERSION}/ros2-apt-source_${ROS_APT_SOURCE_VERSION}.$(. /etc/os-release && echo ${UBUNTU_CODENAME:-${VERSION_CODENAME}})_all.deb\"",
+        "ROS_APT_SOURCE_REDIRECT=$(curl -fsSLI https://github.com/ros-infrastructure/ros-apt-source/releases/latest | awk 'BEGIN { IGNORECASE = 1 } /^location:/ { print $2 }' | tail -n 1 | tr -d '\\r')",
+        "ROS_APT_SOURCE_VERSION=${ROS_APT_SOURCE_REDIRECT##*/}",
+        "if [ -z \"$ROS_APT_SOURCE_VERSION\" ]; then echo 'Failed to resolve ros2-apt-source release version.' >&2; exit 1; fi",
+        "curl -fL -o /tmp/ros2-apt-source.deb \"https://github.com/ros-infrastructure/ros-apt-source/releases/download/${ROS_APT_SOURCE_VERSION}/ros2-apt-source_${ROS_APT_SOURCE_VERSION}.$(. /etc/os-release && echo ${UBUNTU_CODENAME:-${VERSION_CODENAME}})_all.deb\"",
+        "dpkg-deb --info /tmp/ros2-apt-source.deb >/dev/null",
         "sudo dpkg -i /tmp/ros2-apt-source.deb",
         "sudo apt update",
     ]
@@ -56,7 +60,11 @@ def run_initial_setup(paths: AppPaths, log_path: Path, skip_upgrade: bool = Fals
             "rosdep update",
         ]
     )
-    return run_bash("\n".join(setup_lines), cwd=paths.repo_root, log_path=log_path, interactive=True)
+    return "\n".join(setup_lines)
+
+
+def run_initial_setup(paths: AppPaths, log_path: Path, skip_upgrade: bool = False) -> CommandResult:
+    return run_bash(build_initial_setup_script(skip_upgrade=skip_upgrade), cwd=paths.repo_root, log_path=log_path, interactive=True)
 
 
 def run_workspace_build(paths: AppPaths, log_path: Path, packages: list[str] | None = None) -> CommandResult:
