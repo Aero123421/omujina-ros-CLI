@@ -64,6 +64,8 @@ class RuntimeState:
     active_policy_hash: str = ""
     last_action: str = ""
     last_sim_success: bool = False
+    last_sim_policy_hash: str = ""
+    real_setup_requires_relogin: bool = False
     tmux_session_name: str = ""
 
 

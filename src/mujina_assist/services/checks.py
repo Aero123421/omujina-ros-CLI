@@ -85,6 +85,22 @@ def count_usb_policies() -> int:
     return count
 
 
+def workspace_clone_ready(paths: AppPaths) -> bool:
+    return (
+        paths.upstream_dir.exists()
+        and (paths.upstream_dir / ".git").exists()
+        and (paths.upstream_dir / "mujina_control").exists()
+        and (paths.upstream_dir / "mujina_description").exists()
+    )
+
+
+def workspace_build_ready(paths: AppPaths) -> bool:
+    return (
+        (paths.workspace_dir / "install" / "setup.bash").exists()
+        and (paths.workspace_dir / "install" / "mujina_control").exists()
+    )
+
+
 def build_doctor_report(paths: AppPaths, state: RuntimeState) -> DoctorReport:
     os_release = read_os_release()
     os_label = (
@@ -94,8 +110,8 @@ def build_doctor_report(paths: AppPaths, state: RuntimeState) -> DoctorReport:
     )
     ubuntu_24_04 = os_release.get("VERSION_ID") == "24.04"
     ros_installed = Path("/opt/ros/jazzy/setup.bash").exists()
-    workspace_cloned = paths.upstream_dir.exists()
-    workspace_built = (paths.workspace_dir / "install" / "setup.bash").exists()
+    workspace_cloned = workspace_clone_ready(paths)
+    workspace_built = workspace_build_ready(paths)
     usb_policy_count = count_usb_policies()
     active_policy = current_policy_label(paths, state)
     devices = detect_real_devices()
@@ -129,10 +145,12 @@ def build_doctor_report(paths: AppPaths, state: RuntimeState) -> DoctorReport:
     else:
         recommendation = "可視化または SIM から試すのがおすすめです。"
     if workspace_built and not tool_status["tmux"]:
-        notes.append("tmux が無い場合、SIM や実機は単独プロセス起動になります。")
+        notes.append("tmux が無い場合、SIM は単独起動になります。実機起動は tmux が必要です。")
     if state.last_action == "policy_switch" and not state.last_sim_success:
         notes.append("policy を切り替えた直後です。まずは SIM と ONNX テストで確認してください。")
-    if workspace_cloned and (not real_setup["dialout"] or not real_setup["udev_rule"]):
+    if state.real_setup_requires_relogin and real_setup["udev_rule"] and not real_setup["dialout"]:
+        notes.append("実機用設定は入りましたが、dialout を反映するには一度ログアウトして再ログインしてください。")
+    elif workspace_cloned and (not real_setup["dialout"] or not real_setup["udev_rule"]):
         notes.append("実機を使う場合は dialout 追加と 90-mujina.rules の配置が必要です。")
     if real_setup["dialout"] and not real_setup["udev_rule"]:
         notes.append("/etc/udev/rules.d/90-mujina.rules がまだ入っていません。")

@@ -30,9 +30,9 @@ cd ros-mujina-project
 
 1. `./start.sh`
 2. `初回セットアップ`
-3. `build`
-4. `可視化`
-5. `SIM`
+3. `可視化`
+4. `SIM`
+5. 必要なら `ONNX 読み込みテスト`
 6. 必要なら `policy 切替`
 7. 実機を使う予定ならセットアップ中に `dialout` と `udev` の設定も行う
 
@@ -61,6 +61,7 @@ CLI を直接呼ぶ形は開発者向けのため、通常利用では `./start.
 - SIM 起動
 - 実機起動
 - policy 切替
+- ONNX 読み込みテスト
 - motor read
 - zero position
 - ログ表示

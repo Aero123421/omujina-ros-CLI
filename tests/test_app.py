@@ -44,6 +44,21 @@ class AppTest(unittest.TestCase):
                 self.assertEqual(app._select_can_mode("serial"), "serial")
                 self.assertEqual(app._select_can_mode("net"), "net")
 
+    def test_ask_ids_rejects_invalid_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = MujinaAssistApp(Path(tmp))
+            with patch("mujina_assist.app.ask_text", return_value="1 a 2"):
+                self.assertEqual(app._ask_ids(), [])
+
+    def test_ask_ids_accepts_commas(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = MujinaAssistApp(Path(tmp))
+            with patch("mujina_assist.app.ask_text", return_value="1,2,3"), patch(
+                "mujina_assist.app.ask_yes_no",
+                return_value=True,
+            ):
+                self.assertEqual(app._ask_ids(), [1, 2, 3])
+
 
 if __name__ == "__main__":
     unittest.main()

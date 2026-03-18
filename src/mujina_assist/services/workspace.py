@@ -4,6 +4,7 @@ import shutil
 from pathlib import Path
 
 from mujina_assist.models import AppPaths
+from mujina_assist.services.checks import workspace_clone_ready
 from mujina_assist.services.shell import CommandResult, run_bash, shell_quote
 
 
@@ -20,8 +21,10 @@ def ros_prefix(paths: AppPaths, use_workspace: bool = True) -> str:
 
 def ensure_upstream_clone(paths: AppPaths, log_path: Path) -> CommandResult:
     paths.workspace_src_dir.mkdir(parents=True, exist_ok=True)
-    if paths.upstream_dir.exists():
+    if workspace_clone_ready(paths):
         return CommandResult(command="git clone", returncode=0, stdout="already cloned")
+    if paths.upstream_dir.exists():
+        shutil.rmtree(paths.upstream_dir, ignore_errors=True)
     script = f"git clone {UPSTREAM_REPO} {shell_quote(paths.upstream_dir)}"
     return run_bash(script, cwd=paths.repo_root, log_path=log_path, interactive=True)
 
@@ -90,6 +93,24 @@ def run_workspace_build_with_options(
     install_python_deps: bool = True,
     run_colcon_build: bool = True,
 ) -> CommandResult:
+    script = build_workspace_script(
+        paths,
+        packages=packages,
+        run_rosdep_step=run_rosdep_step,
+        install_python_deps=install_python_deps,
+        run_colcon_build=run_colcon_build,
+    )
+    return run_bash(script, cwd=paths.workspace_dir, log_path=log_path, interactive=True)
+
+
+def build_workspace_script(
+    paths: AppPaths,
+    *,
+    packages: list[str] | None = None,
+    run_rosdep_step: bool = True,
+    install_python_deps: bool = True,
+    run_colcon_build: bool = True,
+) -> str:
     package_clause = ""
     if packages:
         package_clause = " --packages-select " + " ".join(packages)
@@ -101,8 +122,11 @@ def run_workspace_build_with_options(
     if run_rosdep_step:
         script_lines.append("rosdep install -r -y -i --from-paths .")
     if install_python_deps:
-        script_lines.append(
-            "python3 -m pip install --break-system-packages mujoco torch torchvision torchaudio onnxruntime"
+        script_lines.extend(
+            [
+                "python3 -m pip install --break-system-packages mujoco onnxruntime",
+                "python3 -m pip install --break-system-packages --index-url https://download.pytorch.org/whl/cpu torch torchvision torchaudio",
+            ]
         )
     if run_colcon_build:
         script_lines.extend(
@@ -111,8 +135,7 @@ def run_workspace_build_with_options(
                 f"colcon build --symlink-install{package_clause}",
             ]
         )
-    script = "\n".join(script_lines)
-    return run_bash(script, cwd=paths.workspace_dir, log_path=log_path, interactive=True)
+    return "\n".join(script_lines)
 
 
 def run_onnx_self_test(paths: AppPaths, log_path: Path) -> CommandResult:

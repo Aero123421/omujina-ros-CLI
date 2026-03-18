@@ -26,6 +26,16 @@ def attach_tmux_session(session_name: str) -> int:
     return result.returncode
 
 
+def tmux_session_dead_panes(session_name: str) -> int:
+    result = run_bash(
+        f"tmux list-panes -t {shlex.quote(session_name)} -F '#{{pane_dead}}'",
+        interactive=False,
+    )
+    if result.returncode != 0:
+        return 1
+    return sum(1 for line in result.stdout.splitlines() if line.strip() == "1")
+
+
 def start_sim_session(paths: AppPaths, session_name: str, with_joy: bool = True) -> int:
     main_command = " && ".join(
         [
@@ -49,7 +59,13 @@ def start_sim_session(paths: AppPaths, session_name: str, with_joy: bool = True)
             f"tmux split-window -h -t {shlex.quote(session_name)} {shlex.quote(f'bash -lc {shlex.quote(joy_command)}')}"
         )
         script_parts.append(f"tmux select-layout -t {shlex.quote(session_name)} tiled")
-    script_parts.append(f"tmux attach -t {shlex.quote(session_name)}")
+    script_parts.extend(
+        [
+            "sleep 3",
+            f"test \"$(tmux list-panes -t {shlex.quote(session_name)} -F '#{{pane_dead}}' | grep -c '^1$')\" -eq 0",
+            f"tmux attach -t {shlex.quote(session_name)}",
+        ]
+    )
     result = run_bash(" && ".join(script_parts), interactive=True)
     return result.returncode
 
@@ -83,6 +99,8 @@ def start_real_session(paths: AppPaths, session_name: str, can_mode: str = "net"
         f"tmux split-window -h -t {shlex.quote(session_name)} {shlex.quote(f'bash -lc {shlex.quote(main_command)}')}",
         f"tmux split-window -v -t {shlex.quote(session_name)} {shlex.quote(f'bash -lc {shlex.quote(joy_command)}')}",
         f"tmux select-layout -t {shlex.quote(session_name)} tiled",
+        "sleep 3",
+        f"test \"$(tmux list-panes -t {shlex.quote(session_name)} -F '#{{pane_dead}}' | grep -c '^1$')\" -eq 0",
         f"tmux attach -t {shlex.quote(session_name)}",
     ]
     result = run_bash(" && ".join(script_parts), interactive=True)

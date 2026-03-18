@@ -4,9 +4,9 @@ import argparse
 from pathlib import Path
 
 from mujina_assist.models import AppPaths, PolicyCandidate
-from mujina_assist.services.checks import build_doctor_report, detect_real_devices, write_config_file
+from mujina_assist.services.checks import build_doctor_report, detect_real_devices, workspace_build_ready, workspace_clone_ready, write_config_file
 from mujina_assist.services.policy import activate_policy, all_policy_candidates
-from mujina_assist.services.processes import attach_tmux_session, kill_tmux_session, start_real_session, start_sim_session, tmux_available, tmux_session_exists
+from mujina_assist.services.processes import attach_tmux_session, kill_tmux_session, start_real_session, start_sim_session, tmux_available, tmux_session_dead_panes, tmux_session_exists
 from mujina_assist.services.shell import run_bash, shell_quote
 from mujina_assist.services.state import load_runtime_state, save_runtime_state
 from mujina_assist.services.workspace import capture_default_policy, ensure_upstream_clone, ros_prefix, run_initial_setup, run_onnx_self_test, run_real_device_setup, run_workspace_build, run_workspace_dependency_setup
@@ -59,6 +59,7 @@ class MujinaAssistApp:
                 "SIM を起動する",
                 "実機を起動する",
                 "ポリシーを切り替える",
+                "ONNX 読み込みテスト",
                 "モータの現在値を読む",
                 "初期位置を設定する",
                 "ログを見る",
@@ -81,12 +82,14 @@ class MujinaAssistApp:
             elif selection == 6:
                 self.handle_policy_menu()
             elif selection == 7:
-                self.handle_motor_read()
+                self.handle_policy_test()
             elif selection == 8:
-                self.handle_zero_position()
+                self.handle_motor_read()
             elif selection == 9:
-                self.handle_logs()
+                self.handle_zero_position()
             elif selection == 10:
+                self.handle_logs()
+            elif selection == 11:
                 return 0
             pause()
 
@@ -178,10 +181,12 @@ class MujinaAssistApp:
             if real_setup_result.returncode != 0:
                 warn("実機用のデバイス設定は完了しませんでした。SIM や可視化はそのまま使えます。")
             else:
+                self.state.real_setup_requires_relogin = True
                 warn("実機用のデバイス設定を反映するには、一度ログアウトして再ログインしてください。")
 
         self.state.last_action = "setup"
         self.state.last_sim_success = False
+        self.state.last_sim_policy_hash = ""
         self.save_state()
         success("初回セットアップが完了しました。")
         bullet(f"ログ: {log_path}")
@@ -212,6 +217,7 @@ class MujinaAssistApp:
         self._sync_default_policy_state()
         self.state.last_action = "build"
         self.state.last_sim_success = False
+        self.state.last_sim_policy_hash = ""
         self.save_state()
         success("build が完了しました。")
         return 0
@@ -275,7 +281,7 @@ class MujinaAssistApp:
                         "policy.onnx の読み込みに失敗しています。",
                     ],
                     next_steps=[
-                        "まず `ポリシー切り替え` のあとなら `policy --test` 相当の読込結果を確認してください。",
+                        "メニューの `ONNX 読み込みテスト` を先に試してください。",
                         "次に `build する` をやり直してから再試行してください。",
                     ],
                 )
@@ -295,6 +301,7 @@ class MujinaAssistApp:
             self.state.tmux_session_name = session_name
         self.state.last_action = "sim"
         self.state.last_sim_success = result.returncode == 0
+        self.state.last_sim_policy_hash = self.state.active_policy_hash if result.returncode == 0 else ""
         self.save_state()
         return result.returncode
 
@@ -307,12 +314,16 @@ class MujinaAssistApp:
             return 1
         missing = self._missing_devices_for_can_mode(selected_can_mode, include_imu=True, include_joy=True)
         if missing:
-            error("実機起動に必要なデバイスが足りません。")
-            for item in missing:
-                bullet(item)
+            self._report_missing_devices(
+                "実機起動に必要なデバイスが足りません。",
+                missing,
+                can_mode=selected_can_mode,
+                include_imu=True,
+                include_joy=True,
+            )
             return 1
-        if not self.state.last_sim_success:
-            warn("まだこの CLI では直前の SIM 成功が確認できていません。")
+        if not self.state.last_sim_success or self.state.last_sim_policy_hash != self.state.active_policy_hash:
+            warn("まだこの policy での直前 SIM 成功が確認できていません。")
             if not ask_yes_no("それでも実機起動へ進みますか？", default=False):
                 return 1
         warn("この操作は実機を動かす可能性があります。")
@@ -336,6 +347,10 @@ class MujinaAssistApp:
                 result_code = start_real_session(self.paths, session_name, can_mode=selected_can_mode)
         else:
             result_code = start_real_session(self.paths, session_name, can_mode=selected_can_mode)
+        if result_code == 0 and tmux_session_dead_panes(session_name) > 0:
+            warn("tmux セッションは作れましたが、起動直後に落ちたペインがあります。")
+            bullet("各ペインのログを確認してください。")
+            result_code = 1
         self.state.tmux_session_name = session_name
         self.state.last_action = "real"
         self.save_state()
@@ -366,9 +381,12 @@ class MujinaAssistApp:
         log_path = self.paths.logs_dir / "policy.log"
         ok, message = activate_policy(self.paths, self.state, candidate, log_path)
         if ok:
+            self.state.last_sim_success = False
+            self.state.last_sim_policy_hash = ""
             self.save_state()
             success(message)
             bullet("この後はまず SIM で確認するのがおすすめです。")
+            bullet("必要ならメニューの `ONNX 読み込みテスト` で先に形式確認ができます。")
             return 0
         self._report_failure(
             message,
@@ -393,9 +411,13 @@ class MujinaAssistApp:
             return 1
         missing = self._missing_devices_for_can_mode(selected_can_mode, include_imu=False, include_joy=False)
         if missing:
-            error("CAN 通信に必要なデバイスが足りません。")
-            for item in missing:
-                bullet(item)
+            self._report_missing_devices(
+                "CAN 通信に必要なデバイスが足りません。",
+                missing,
+                can_mode=selected_can_mode,
+                include_imu=False,
+                include_joy=False,
+            )
             return 1
         ids = ids or self._ask_ids()
         if not ids:
@@ -404,15 +426,7 @@ class MujinaAssistApp:
         warn("この操作は読み取り専用ですが、CAN 通信を使います。")
         if not ask_yes_no("続けますか？", default=False):
             return 1
-        can_script = "./mujina_control/scripts/can_setup_serial.sh" if selected_can_mode == "serial" else "./mujina_control/scripts/can_setup_net.sh"
-        script = " && ".join(
-            [
-                ros_prefix(self.paths),
-                f"cd {shell_quote(self.paths.upstream_dir)}",
-                can_script,
-                "python3 mujina_control/scripts/motor_test_read_only.py --ids " + " ".join(str(i) for i in ids),
-            ]
-        )
+        script = self._build_motor_read_script(ids, selected_can_mode)
         log_path = self.paths.logs_dir / "motor-read.log"
         result = run_bash(script, cwd=self.paths.workspace_dir, log_path=log_path, interactive=True)
         if result.returncode != 0:
@@ -440,9 +454,13 @@ class MujinaAssistApp:
             return 1
         missing = self._missing_devices_for_can_mode(selected_can_mode, include_imu=False, include_joy=False)
         if missing:
-            error("CAN 通信に必要なデバイスが足りません。")
-            for item in missing:
-                bullet(item)
+            self._report_missing_devices(
+                "CAN 通信に必要なデバイスが足りません。",
+                missing,
+                can_mode=selected_can_mode,
+                include_imu=False,
+                include_joy=False,
+            )
             return 1
         warn("この操作はモータ原点を変更します。姿勢が誤っていると危険です。")
         bullet("README 記載の原点姿勢になっていることを確認してください。")
@@ -456,6 +474,23 @@ class MujinaAssistApp:
         if not ids:
             error("ID が指定されていません。")
             return 1
+        preflight_script = self._build_motor_read_script(ids, selected_can_mode)
+        preflight_log_path = self.paths.logs_dir / "motor-zero-preflight.log"
+        preflight_result = run_bash(preflight_script, cwd=self.paths.workspace_dir, log_path=preflight_log_path, interactive=True)
+        if preflight_result.returncode != 0:
+            self._report_failure(
+                "原点設定の前提確認に失敗しました。",
+                preflight_log_path,
+                causes=[
+                    "選んだ CAN 接続方式と実機が一致していません。",
+                    "指定した ID のモータへ read-only 通信できていません。",
+                ],
+                next_steps=[
+                    "まず `モータの現在値を読む` を同じ ID で成功させてください。",
+                    "成功してから改めて `初期位置設定` を実行してください。",
+                ],
+            )
+            return preflight_result.returncode
         can_script = "./mujina_control/scripts/can_setup_serial.sh" if selected_can_mode == "serial" else "./mujina_control/scripts/can_setup_net.sh"
         script = " && ".join(
             [
@@ -484,6 +519,7 @@ class MujinaAssistApp:
         return result.returncode
 
     def handle_policy_test(self) -> int:
+        title("ONNX 読み込みテスト")
         if not self._require_built_workspace():
             return 1
         log_path = self.paths.logs_dir / "policy-test.log"
@@ -506,11 +542,21 @@ class MujinaAssistApp:
         return result.returncode
 
     def _ask_ids(self) -> list[int]:
-        raw = ask_text("対象の motor ID を空白区切りで入力してください。例: 1 2 3")
-        values: list[int] = []
-        for chunk in raw.split():
-            if chunk.isdigit():
-                values.append(int(chunk))
+        raw = ask_text("対象の motor ID を空白またはカンマ区切りで入力してください。例: 1 2 3 / 1,2,3")
+        normalized = raw.replace(",", " ")
+        tokens = [chunk for chunk in normalized.split() if chunk]
+        if not tokens:
+            return []
+        invalid = [chunk for chunk in tokens if not chunk.isdigit()]
+        if invalid:
+            error("ID の入力に数字以外が含まれています。")
+            bullet(f"解釈できなかった値: {', '.join(invalid)}")
+            return []
+        values = [int(chunk) for chunk in tokens]
+        bullet("対象 ID: " + " ".join(str(value) for value in values))
+        if not ask_yes_no("この ID で続けますか？", default=True):
+            warn("ID 入力をやり直してください。")
+            return []
         return values
 
     def _sync_default_policy_state(self) -> None:
@@ -542,16 +588,15 @@ class MujinaAssistApp:
         return 0
 
     def _require_cloned_workspace(self) -> bool:
-        if self.paths.upstream_dir.exists():
+        if workspace_clone_ready(self.paths):
             return True
-        error("mujina_ros の clone がまだありません。先に初回セットアップを実行してください。")
+        error("mujina_ros の clone が未完了です。先に初回セットアップを実行してください。")
         return False
 
     def _require_built_workspace(self) -> bool:
         if not self._require_cloned_workspace():
             return False
-        workspace_setup = self.paths.workspace_dir / "install" / "setup.bash"
-        if workspace_setup.exists():
+        if workspace_build_ready(self.paths):
             return True
         error("build がまだ終わっていません。先に build を実行してください。")
         return False
@@ -594,6 +639,41 @@ class MujinaAssistApp:
             required.append("/dev/input/js0")
         required.append("can0" if can_mode == "net" else "/dev/usb_can")
         return [name for name in required if not devices.get(name, False)]
+
+    def _report_missing_devices(
+        self,
+        summary: str,
+        missing: list[str],
+        *,
+        can_mode: str,
+        include_imu: bool,
+        include_joy: bool,
+    ) -> None:
+        error(summary)
+        for item in missing:
+            bullet(item)
+        section("次にやること")
+        if include_imu and "/dev/rt_usb_imu" in missing:
+            bullet("IMU を挿し直し、必要なら一度ログアウトして再ログインしてください。")
+        if can_mode == "net" and "can0" in missing:
+            bullet("network CAN を使うなら、CAN セットアップ後に `can0` が見える状態で再実行してください。")
+            bullet("USB-CAN が serial 型なら、実行前に CAN モードを `serial` に切り替えてください。")
+        if can_mode == "serial" and "/dev/usb_can" in missing:
+            bullet("serial CAN アダプタを挿し直し、必要なら `dialout` と udev 設定後に再ログインしてください。")
+            bullet("すでに `can0` がある構成なら、CAN モードを `net` に切り替えてください。")
+        if include_joy and "/dev/input/js0" in missing:
+            bullet("ゲームパッドをつなぎ直し、OS から認識されていることを確認してください。")
+
+    def _build_motor_read_script(self, ids: list[int], can_mode: str) -> str:
+        can_script = "./mujina_control/scripts/can_setup_serial.sh" if can_mode == "serial" else "./mujina_control/scripts/can_setup_net.sh"
+        return " && ".join(
+            [
+                ros_prefix(self.paths),
+                f"cd {shell_quote(self.paths.upstream_dir)}",
+                can_script,
+                "python3 mujina_control/scripts/motor_test_read_only.py --ids " + " ".join(str(i) for i in ids),
+            ]
+        )
 
     def _report_failure(
         self,
