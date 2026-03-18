@@ -124,8 +124,9 @@ def build_workspace_script(
     if install_python_deps:
         script_lines.extend(
             [
-                "python3 -m pip install --break-system-packages mujoco onnxruntime",
-                "python3 -m pip install --break-system-packages --index-url https://download.pytorch.org/whl/cpu torch torchvision torchaudio",
+                "export PIP_NO_CACHE_DIR=1",
+                "python3 -m pip install --break-system-packages --no-cache-dir mujoco onnxruntime",
+                "python3 -m pip install --break-system-packages --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch torchvision torchaudio",
             ]
         )
     if run_colcon_build:

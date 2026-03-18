@@ -37,7 +37,8 @@ class WorkspaceTest(unittest.TestCase):
 
             script = mocked.call_args.args[0]
             self.assertIn("https://download.pytorch.org/whl/cpu", script)
-            self.assertIn("python3 -m pip install --break-system-packages mujoco onnxruntime", script)
+            self.assertIn("export PIP_NO_CACHE_DIR=1", script)
+            self.assertIn("python3 -m pip install --break-system-packages --no-cache-dir mujoco onnxruntime", script)
 
 
 if __name__ == "__main__":
