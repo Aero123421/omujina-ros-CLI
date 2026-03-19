@@ -3,11 +3,12 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from mujina_assist.app import MujinaAssistApp
 from mujina_assist.models import DoctorReport, PolicyCandidate
-from mujina_assist.services.jobs import list_jobs
+from mujina_assist.services.jobs import create_job, list_jobs
 
 
 class AppTest(unittest.TestCase):
@@ -123,6 +124,30 @@ class AppTest(unittest.TestCase):
             self.assertTrue(jobs[0].payload["skip_upgrade"])
             self.assertTrue(jobs[0].payload["setup_real_devices"])
 
+    def legacy_test_handle_zero_position_requires_explicit_zero_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = MujinaAssistApp(Path(tmp))
+            self._prepare_built_workspace(app)
+
+            with patch.object(app, "_select_can_mode", return_value="net"), patch(
+                "mujina_assist.app.detect_real_devices",
+                return_value={
+                    "/dev/rt_usb_imu": False,
+                    "/dev/usb_can": False,
+                    "/dev/input/js0": False,
+                    "can0": True,
+                },
+            ), patch("mujina_assist.app.ask_text", return_value="nope"), patch.object(
+                app,
+                "_launch_job",
+                return_value=0,
+            ) as launch_job:
+                result = app.handle_zero_position(ids=[1], can_mode="net")
+
+            self.assertEqual(result, 1)
+            launch_job.assert_not_called()
+            self.assertEqual(list_jobs(app.paths), [])
+
     def test_handle_sim_creates_two_jobs_and_updates_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             app = MujinaAssistApp(Path(tmp))
@@ -143,6 +168,88 @@ class AppTest(unittest.TestCase):
             self.assertEqual(app.state.last_action, "sim_launch")
             self.assertFalse(app.state.last_sim_success)
             self.assertEqual(app.state.last_sim_policy_hash, "")
+
+    def legacy_test_execute_zero_job_stops_when_preflight_motor_read_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = MujinaAssistApp(Path(tmp))
+            self._prepare_built_workspace(app)
+            job = create_job(
+                app.paths,
+                kind="zero",
+                name="初期位置設定 (1 2)",
+                payload={"ids": [1, 2], "can_mode": "net"},
+            )
+
+            with patch(
+                "mujina_assist.app.run_bash",
+                return_value=SimpleNamespace(returncode=2),
+            ) as run_bash_mock, patch.object(
+                app,
+                "_execute_shell_job",
+            ) as execute_shell_job_mock:
+                result = app._execute_zero_job(job)
+
+            self.assertEqual(result[0], 2)
+            self.assertIn("前提確認", result[1])
+            self.assertFalse(result[2])
+            execute_shell_job_mock.assert_not_called()
+            self.assertIn("motor_test_read_only.py", run_bash_mock.call_args.args[0])
+            self.assertEqual(
+                run_bash_mock.call_args.kwargs["log_path"],
+                Path(job.log_path).with_suffix(".preflight.log"),
+            )
+
+    def legacy_test_execute_zero_job_runs_preflight_then_zero_script(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = MujinaAssistApp(Path(tmp))
+            self._prepare_built_workspace(app)
+            job = create_job(
+                app.paths,
+                kind="zero",
+                name="初期位置設定 (3)",
+                payload={"ids": [3], "can_mode": "serial"},
+            )
+
+            with patch(
+                "mujina_assist.app.run_bash",
+                return_value=SimpleNamespace(returncode=0),
+            ) as run_bash_mock, patch.object(
+                app,
+                "_execute_shell_job",
+                return_value=(0, "初期位置設定が完了しました。", False),
+            ) as execute_shell_job_mock:
+                result = app._execute_zero_job(job)
+
+            self.assertEqual(result, (0, "初期位置設定が完了しました。", False))
+            self.assertIn("motor_test_read_only.py", run_bash_mock.call_args.args[0])
+            self.assertEqual(
+                run_bash_mock.call_args.kwargs["log_path"],
+                Path(job.log_path).with_suffix(".preflight.log"),
+            )
+            self.assertIn("motor_set_zero_position.py", execute_shell_job_mock.call_args.args[1])
+
+    def test_execute_zero_job_rejects_empty_ids_before_running_scripts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = MujinaAssistApp(Path(tmp))
+            self._prepare_built_workspace(app)
+            job = create_job(
+                app.paths,
+                kind="zero",
+                name="初期位置設定 ()",
+                payload={"ids": [], "can_mode": "net"},
+            )
+
+            with patch("mujina_assist.app.run_bash") as run_bash_mock, patch.object(
+                app,
+                "_execute_shell_job",
+            ) as execute_shell_job_mock:
+                result = app._execute_zero_job(job)
+
+            self.assertEqual(result[0], 1)
+            self.assertIn("対象 ID", result[1])
+            self.assertFalse(result[2])
+            run_bash_mock.assert_not_called()
+            execute_shell_job_mock.assert_not_called()
 
     def test_mark_sim_verified_records_current_policy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -292,6 +399,140 @@ class AppTest(unittest.TestCase):
             self.assertEqual(prepared.source_type, "cache")
             self.assertTrue(prepared.path.exists())
             self.assertEqual(prepared.path.read_bytes(), b"onnx")
+
+    def test_handle_zero_position_requires_targeted_confirmation_phrase(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = MujinaAssistApp(Path(tmp))
+            self._prepare_built_workspace(app)
+
+            with patch.object(app, "_select_can_mode", return_value="net"), patch(
+                "mujina_assist.app.detect_real_devices",
+                return_value={
+                    "/dev/rt_usb_imu": False,
+                    "/dev/usb_can": False,
+                    "/dev/input/js0": False,
+                    "can0": True,
+                },
+            ), patch("mujina_assist.app.ask_text", return_value="ZERO"), patch.object(
+                app,
+                "_launch_job",
+                return_value=0,
+            ) as launch_job:
+                result = app.handle_zero_position(ids=[1], can_mode="net")
+
+            self.assertEqual(result, 1)
+            launch_job.assert_not_called()
+            self.assertEqual(list_jobs(app.paths), [])
+
+    def test_handle_zero_position_bails_out_before_confirmation_when_can_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = MujinaAssistApp(Path(tmp))
+            self._prepare_built_workspace(app)
+
+            with patch.object(app, "_select_can_mode", return_value="net"), patch(
+                "mujina_assist.app.detect_real_devices",
+                return_value={
+                    "/dev/rt_usb_imu": False,
+                    "/dev/usb_can": False,
+                    "/dev/input/js0": False,
+                    "can0": False,
+                },
+            ), patch("mujina_assist.app.ask_text") as ask_text_mock, patch.object(
+                app,
+                "_launch_job",
+            ) as launch_job_mock:
+                result = app.handle_zero_position(ids=[1], can_mode="net")
+
+            self.assertEqual(result, 1)
+            ask_text_mock.assert_not_called()
+            launch_job_mock.assert_not_called()
+
+    def test_execute_zero_job_stops_when_probe_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = MujinaAssistApp(Path(tmp))
+            self._prepare_built_workspace(app)
+            job = create_job(
+                app.paths,
+                kind="zero",
+                name="zero (1 2)",
+                payload={"ids": [1, 2], "can_mode": "net"},
+            )
+
+            with patch(
+                "mujina_assist.app.run_bash",
+                return_value=SimpleNamespace(returncode=2),
+            ) as run_bash_mock, patch.object(
+                app,
+                "_execute_shell_job",
+            ) as execute_shell_job_mock:
+                result = app._execute_zero_job(job)
+
+            self.assertEqual(result[0], 2)
+            self.assertIn("前提確認", result[1])
+            self.assertFalse(result[2])
+            execute_shell_job_mock.assert_not_called()
+            self.assertIn("Motor probe completed.", run_bash_mock.call_args.args[0])
+            self.assertIn("can_setup_net.sh", run_bash_mock.call_args.args[0])
+            self.assertEqual(
+                run_bash_mock.call_args.kwargs["log_path"],
+                Path(job.log_path).with_suffix(".preflight.log"),
+            )
+
+    def test_execute_zero_job_runs_probe_then_zero_script(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = MujinaAssistApp(Path(tmp))
+            self._prepare_built_workspace(app)
+            job = create_job(
+                app.paths,
+                kind="zero",
+                name="zero (3)",
+                payload={"ids": [3], "can_mode": "serial"},
+            )
+
+            with patch(
+                "mujina_assist.app.run_bash",
+                return_value=SimpleNamespace(returncode=0),
+            ) as run_bash_mock, patch.object(
+                app,
+                "_execute_shell_job",
+                return_value=(0, "ok", False),
+            ) as execute_shell_job_mock:
+                result = app._execute_zero_job(job)
+
+            self.assertEqual(result, (0, "ok", False))
+            self.assertIn("Motor probe completed.", run_bash_mock.call_args.args[0])
+            self.assertIn("can_setup_serial.sh", run_bash_mock.call_args.args[0])
+            self.assertEqual(
+                run_bash_mock.call_args.kwargs["log_path"],
+                Path(job.log_path).with_suffix(".preflight.log"),
+            )
+            self.assertIn("motor_set_zero_position.py", execute_shell_job_mock.call_args.args[1])
+            self.assertIn("--device can0", execute_shell_job_mock.call_args.args[1])
+            self.assertNotIn("can_setup_serial.sh", execute_shell_job_mock.call_args.args[1])
+
+    def test_execute_zero_job_treats_preflight_interrupt_as_stopped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = MujinaAssistApp(Path(tmp))
+            self._prepare_built_workspace(app)
+            job = create_job(
+                app.paths,
+                kind="zero",
+                name="zero (5)",
+                payload={"ids": [5], "can_mode": "net"},
+            )
+
+            with patch(
+                "mujina_assist.app.run_bash",
+                return_value=SimpleNamespace(returncode=130),
+            ) as run_bash_mock, patch.object(
+                app,
+                "_execute_shell_job",
+            ) as execute_shell_job_mock:
+                result = app._execute_zero_job(job)
+
+            self.assertEqual(result, (130, "原点設定の前提確認を中断しました。", True))
+            execute_shell_job_mock.assert_not_called()
+            self.assertIn("Motor probe completed.", run_bash_mock.call_args.args[0])
 
 
 if __name__ == "__main__":

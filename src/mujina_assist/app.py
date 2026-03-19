@@ -31,6 +31,7 @@ from mujina_assist.services.jobs import (
 from mujina_assist.services.policy import activate_policy, all_policy_candidates, import_policy_to_cache
 from mujina_assist.services.processes import (
     build_joy_script,
+    build_motor_probe_script,
     build_motor_read_script,
     build_real_imu_script,
     build_real_main_script,
@@ -457,6 +458,7 @@ class MujinaAssistApp:
         return self._launch_job(job)
 
     def handle_zero_position(self, ids: list[int] | None = None, can_mode: str = "auto") -> int:
+        return self._handle_zero_position_safe(ids=ids, can_mode=can_mode)
         title("初期位置設定")
         if not self._require_built_workspace():
             return 1
@@ -479,6 +481,7 @@ class MujinaAssistApp:
         bullet("README 記載の原点姿勢になっていることを確認してください。")
         bullet("補助者がいる状態で実行してください。")
         bullet("前提確認として read-only 通信テストもワーカー側で自動実行します。")
+        bullet("`motor read` の成功は通信確認だけです。書き込みを伴う zero の成功までは保証しません。")
         typed = ask_text("本当に実行する場合だけ ZERO と入力してください。")
         if typed != "ZERO":
             warn("初期位置設定を中止しました。")
@@ -491,6 +494,47 @@ class MujinaAssistApp:
             self.paths,
             kind="zero",
             name=f"初期位置設定 ({' '.join(str(i) for i in ids)})",
+            payload={"ids": ids, "can_mode": selected_can_mode},
+        )
+        return self._launch_job(job)
+
+    def _handle_zero_position_safe(self, ids: list[int] | None = None, can_mode: str = "auto") -> int:
+        title("原点位置設定")
+        if not self._require_built_workspace():
+            return 1
+        if not self._confirm_no_conflicting_jobs({"motor_read", "zero", "real_main"}):
+            return 1
+        selected_can_mode = self._select_can_mode(can_mode)
+        if selected_can_mode is None:
+            return 1
+        missing = self._missing_devices_for_can_mode(selected_can_mode, include_imu=False, include_joy=False)
+        if missing:
+            self._report_missing_devices(
+                "CAN 通信に必要なデバイスが足りません。",
+                missing,
+                can_mode=selected_can_mode,
+                include_imu=False,
+                include_joy=False,
+            )
+            return 1
+        ids = ids or self._ask_ids()
+        if not ids:
+            error("ID が指定されていません。")
+            return 1
+        warn("この操作はモータの原点を変更します。姿勢が崩れていると危険です。")
+        bullet("README 記載の原点姿勢になっていることを確認してください。")
+        bullet("補助者がいる状態で実行してください。")
+        bullet("zero の前に one-shot の疎通確認を自動実行し、同じ CAN 設定を使ったまま本処理へ進みます。")
+        bullet("対象 ID: " + " ".join(str(i) for i in ids))
+        confirmation_phrase = self._zero_confirmation_phrase(ids)
+        typed = ask_text(f"本当に実行する場合のみ {confirmation_phrase} と入力してください。")
+        if typed != confirmation_phrase:
+            warn("原点位置設定を中止しました。")
+            return 1
+        job = create_job(
+            self.paths,
+            kind="zero",
+            name=f"原点位置設定 ({' '.join(str(i) for i in ids)})",
             payload={"ids": ids, "can_mode": selected_can_mode},
         )
         return self._launch_job(job)
@@ -667,7 +711,7 @@ class MujinaAssistApp:
                 next_steps=[
                     "接続方式を確認してから再実行してください。",
                 ],
-                allow_sigint_stop=False,
+                allow_sigint_stop=True,
             )
         if job.kind == "zero":
             return self._execute_zero_job(job)
@@ -837,10 +881,26 @@ class MujinaAssistApp:
         return result.returncode, "ONNX 読み込みテストに失敗しました。", False
 
     def _execute_zero_job(self, job: JobRecord) -> tuple[int, str, bool]:
+        return self._execute_zero_job_safe(job)
         title("初期位置設定")
         ids = [int(value) for value in job.payload.get("ids", [])]
         can_mode = job.payload.get("can_mode", "net")
-        preflight_log_path = self.paths.logs_dir / "motor-zero-preflight.log"
+        if not ids:
+            log_path = job_log_path(job)
+            self._report_failure(
+                "初期位置設定の対象 ID がありません。",
+                log_path,
+                causes=[
+                    "ジョブ作成時の ID 指定が空のままです。",
+                    "途中でジョブ定義が壊れた可能性があります。",
+                ],
+                next_steps=[
+                    "もう一度 `初期位置設定` を開き、対象 ID を入れ直してください。",
+                    "不安があれば先に `モータの現在値を読む` を同じ ID で試してください。",
+                ],
+            )
+            return 1, "初期位置設定の対象 ID がありません。", False
+        preflight_log_path = job_log_path(job).with_suffix(".preflight.log")
         preflight_result = run_bash(
             build_motor_read_script(self.paths, ids, can_mode),
             cwd=self.paths.workspace_dir,
@@ -864,6 +924,67 @@ class MujinaAssistApp:
         return self._execute_shell_job(
             job,
             build_zero_script(self.paths, ids, can_mode),
+            "初期位置設定が完了しました。",
+            causes=[
+                "CAN 接続方式の選択が合っていません。",
+                "対象 ID のモータへ通信できていません。",
+                "read-only 通信は通っても、zero は書き込み処理のため別条件で失敗することがあります。",
+                "実機姿勢が正しくなく、途中でエラーになっています。",
+            ],
+            next_steps=[
+                "姿勢確認をやり直してから再実行してください。",
+                "不安があれば motor read で先に通信だけ確認してください。",
+            ],
+            allow_sigint_stop=False,
+        )
+
+    def _execute_zero_job_safe(self, job: JobRecord) -> tuple[int, str, bool]:
+        title("原点位置設定")
+        ids = [int(value) for value in job.payload.get("ids", [])]
+        can_mode = job.payload.get("can_mode", "net")
+        if not ids:
+            log_path = job_log_path(job)
+            self._report_failure(
+                "原点位置設定に対象 ID が含まれていません。",
+                log_path,
+                causes=[
+                    "ジョブ作成時の ID 指定が空のままです。",
+                    "途中でジョブ定義が壊れた可能性があります。",
+                ],
+                next_steps=[
+                    "もう一度 `原点位置設定` を開き、対象 ID を入れ直してください。",
+                    "不安があれば先に `モータの現在値を読む` を同じ ID で試してください。",
+                ],
+            )
+            return 1, "原点位置設定に対象 ID が含まれていません。", False
+        preflight_log_path = job_log_path(job).with_suffix(".preflight.log")
+        preflight_result = run_bash(
+            build_motor_probe_script(self.paths, ids, can_mode),
+            cwd=self.paths.workspace_dir,
+            log_path=preflight_log_path,
+            interactive=True,
+        )
+        if preflight_result.returncode == 130:
+            warn("原点設定の前提確認を中断しました。")
+            bullet(f"ログ: {preflight_log_path}")
+            return 130, "原点設定の前提確認を中断しました。", True
+        if preflight_result.returncode != 0:
+            self._report_failure(
+                "原点設定の前提確認に失敗しました。",
+                preflight_log_path,
+                causes=[
+                    "選んだ CAN 接続方式と実機が一致していません。",
+                    "指定した ID のモータへ one-shot 通信できていません。",
+                ],
+                next_steps=[
+                    "まず `モータの現在値を読む` を同じ ID で成功させてください。",
+                    "成功してから改めて `初期位置設定` を実行してください。",
+                ],
+            )
+            return preflight_result.returncode, "原点設定の前提確認に失敗しました。", False
+        return self._execute_shell_job(
+            job,
+            build_zero_script(self.paths, ids, can_mode, include_can_setup=False),
             "初期位置設定が完了しました。",
             causes=[
                 "CAN 接続方式の選択が合っていません。",
@@ -1105,6 +1226,9 @@ class MujinaAssistApp:
             return None
         selected = select_from_list("IMU として使うポートを選んでください。", candidates)
         return candidates[selected]
+
+    def _zero_confirmation_phrase(self, ids: list[int]) -> str:
+        return "ZERO " + " ".join(str(value) for value in ids)
 
     def _mark_current_policy_sim_verified(self, *, ask_confirmation: bool) -> int:
         if not self._require_built_workspace():
