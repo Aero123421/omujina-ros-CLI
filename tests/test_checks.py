@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from mujina_assist.models import AppPaths, RuntimeState
-from mujina_assist.services.checks import build_doctor_report, current_policy_label, sim_policy_verified
+from mujina_assist.services.checks import build_doctor_report, current_policy_label, resolve_imu_port, sim_policy_verified
 
 
 class ChecksTest(unittest.TestCase):
@@ -24,6 +24,22 @@ class ChecksTest(unittest.TestCase):
             last_sim_policy_hash="abc",
         )
         self.assertTrue(sim_policy_verified(state))
+
+    def test_resolve_imu_port_falls_back_to_single_generic_serial(self) -> None:
+        with patch.object(
+            Path,
+            "exists",
+            autospec=True,
+            side_effect=lambda path: not str(path).endswith("rt_usb_imu"),
+        ), patch(
+            "mujina_assist.services.checks.list_serial_device_candidates",
+            return_value=["/dev/ttyACM0"],
+        ):
+            port, fallback, candidates = resolve_imu_port()
+
+        self.assertEqual(port, "/dev/ttyACM0")
+        self.assertTrue(fallback)
+        self.assertEqual(candidates, ["/dev/ttyACM0"])
 
     def test_doctor_report_notes_serial_alias_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

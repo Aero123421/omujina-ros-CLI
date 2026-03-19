@@ -10,6 +10,7 @@ from mujina_assist.services.checks import (
     build_doctor_report,
     detect_real_devices,
     list_serial_device_candidates,
+    resolve_imu_port,
     sim_policy_verified,
     workspace_build_ready,
     workspace_clone_ready,
@@ -74,6 +75,9 @@ class MujinaAssistApp:
         bullet(f"active policy: {report.active_policy_label}")
         bullet(f"SIM確認済み: {'OK' if report.sim_ready else '未確認'}")
         bullet(f"USB上のONNX: {report.usb_policy_count} 件")
+        if report.imu_port_label:
+            suffix = " (fallback)" if report.imu_port_fallback else ""
+            bullet(f"IMUポート: {report.imu_port_label}{suffix}")
         real_devices = ", ".join(
             [f"{name}={'OK' if ok else 'NG'}" for name, ok in report.real_devices.items()]
         )
@@ -171,6 +175,11 @@ class MujinaAssistApp:
         bullet(f"active policy: {report.active_policy_label}")
         bullet(f"SIM確認済み: {'OK' if report.sim_ready else '未確認'}")
         bullet(f"想定 CAN モード: {selected_can_mode}")
+        if report.imu_port_label:
+            suffix = " (固定名が無いため fallback 使用)" if report.imu_port_fallback else ""
+            bullet(f"IMUポート: {report.imu_port_label}{suffix}")
+        else:
+            bullet("IMUポート: 未検出")
         if selected_can_mode == "serial":
             bullet(f"slcand: {'OK' if report.tool_status.get('slcand', False) else 'NG'}")
         for name in ("/dev/rt_usb_imu", "/dev/input/js0", "can0" if selected_can_mode == "net" else "/dev/usb_can"):
@@ -319,6 +328,11 @@ class MujinaAssistApp:
                 include_joy=True,
             )
             return 1
+        imu_port = self._resolve_runtime_imu_port()
+        if imu_port is None:
+            error("IMU のポートを確定できませんでした。")
+            bullet("`/dev/rt_usb_imu` が無い場合は、IMU らしい `ttyACM*` / `ttyUSB*` を 1 本に絞る必要があります。")
+            return 1
         if not sim_policy_verified(self.state):
             warn("今の policy で SIM 起動済みの記録がありません。")
             bullet("実機へ進む前に、少なくとも一度は同じ policy で SIM を起動して挙動確認するのがおすすめです。")
@@ -334,7 +348,13 @@ class MujinaAssistApp:
             return 1
         group_id = f"real-{uuid4().hex[:8]}"
         jobs = [
-            create_job(self.paths, kind="real_imu", name="実機 IMU ノード", group_id=group_id),
+            create_job(
+                self.paths,
+                kind="real_imu",
+                name=f"実機 IMU ノード ({Path(imu_port).name})",
+                group_id=group_id,
+                payload={"imu_port": imu_port},
+            ),
             create_job(
                 self.paths,
                 kind="real_main",
@@ -583,9 +603,10 @@ class MujinaAssistApp:
                 allow_sigint_stop=True,
             )
         if job.kind == "real_imu":
+            imu_port = str(payload.get("imu_port", "/dev/rt_usb_imu"))
             return self._execute_shell_job(
                 job,
-                build_real_imu_script(self.paths),
+                build_real_imu_script(self.paths, imu_port),
                 "実機 IMU ノードを停止しました。",
                 causes=[
                     "IMU デバイスが見えていません。",
@@ -988,11 +1009,20 @@ class MujinaAssistApp:
         devices = detect_real_devices()
         required: list[str] = []
         if include_imu:
-            required.append("/dev/rt_usb_imu")
+            imu_port, _imu_fallback, _imu_candidates = resolve_imu_port()
+            required.append("/dev/rt_usb_imu" if imu_port is None else imu_port)
         if include_joy:
             required.append("/dev/input/js0")
         required.append("can0" if can_mode == "net" else "/dev/usb_can")
-        return [name for name in required if not devices.get(name, False)]
+        missing: list[str] = []
+        for name in required:
+            if name in {"/dev/rt_usb_imu", "/dev/usb_can", "/dev/input/js0", "can0"}:
+                if not devices.get(name, False):
+                    missing.append(name)
+                continue
+            if not Path(name).exists():
+                missing.append(name)
+        return missing
 
     def _report_missing_devices(
         self,
@@ -1012,6 +1042,12 @@ class MujinaAssistApp:
             bullet("IMU を挿し直し、必要なら一度ログアウトして再ログインしてください。")
             if serial_candidates:
                 bullet("他の USB シリアル候補は見えていますが、IMU か別機器かはこの CLI だけでは断定できません。")
+        generic_imu_missing = [item for item in missing if item.startswith("/dev/ttyACM") or item.startswith("/dev/ttyUSB")]
+        if include_imu and generic_imu_missing:
+            bullet("IMU の固定名 `/dev/rt_usb_imu` はありませんが、generic serial を IMU 候補として見ています。")
+            for candidate in generic_imu_missing[:2]:
+                bullet(f"候補ポート: {candidate}")
+            bullet("このポートで IMU ドライバを起動します。問題があれば udev ルール整備をおすすめします。")
         if can_mode == "net" and "can0" in missing:
             bullet("network CAN を使うなら、CAN セットアップ後に `can0` が見える状態で再実行してください。")
             bullet("USB-CAN が serial 型なら、実行前に CAN モードを `serial` に切り替えてください。")
@@ -1060,6 +1096,15 @@ class MujinaAssistApp:
             )
             return "net" if selected == 0 else "serial"
         return "net"
+
+    def _resolve_runtime_imu_port(self) -> str | None:
+        port, _fallback, candidates = resolve_imu_port()
+        if port:
+            return port
+        if not candidates:
+            return None
+        selected = select_from_list("IMU として使うポートを選んでください。", candidates)
+        return candidates[selected]
 
     def _mark_current_policy_sim_verified(self, *, ask_confirmation: bool) -> int:
         if not self._require_built_workspace():

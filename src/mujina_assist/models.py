@@ -119,6 +119,8 @@ class DoctorReport:
     sim_ready: bool = False
     real_devices: dict[str, bool] = field(default_factory=dict)
     serial_candidates: list[str] = field(default_factory=list)
+    imu_port_label: str = ""
+    imu_port_fallback: bool = False
     tool_status: dict[str, bool] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
     recommendation: str = ""

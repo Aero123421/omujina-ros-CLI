@@ -41,6 +41,31 @@ class AppTest(unittest.TestCase):
 
             self.assertEqual(missing, [])
 
+    def test_missing_devices_accepts_generic_imu_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = MujinaAssistApp(Path(tmp))
+            generic_imu = app.paths.repo_root / "ttyACM0"
+            generic_imu.write_text("", encoding="utf-8")
+            with patch(
+                "mujina_assist.app.detect_real_devices",
+                return_value={
+                    "/dev/rt_usb_imu": False,
+                    "/dev/usb_can": True,
+                    "/dev/input/js0": True,
+                    "can0": False,
+                },
+            ), patch(
+                "mujina_assist.app.resolve_imu_port",
+                return_value=(str(generic_imu), True, [str(generic_imu)]),
+            ):
+                missing = app._missing_devices_for_can_mode(
+                    "serial",
+                    include_imu=True,
+                    include_joy=True,
+                )
+
+            self.assertEqual(missing, [])
+
     def test_select_can_mode_prefers_available_requested_mode(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             app = MujinaAssistApp(Path(tmp))
@@ -191,6 +216,63 @@ class AppTest(unittest.TestCase):
                 result = app.handle_real_robot()
 
             self.assertEqual(result, 1)
+
+    def test_handle_real_robot_uses_generic_imu_fallback_port(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = MujinaAssistApp(Path(tmp))
+            self._prepare_built_workspace(app)
+            app.state.active_policy_hash = "abc"
+            app.state.last_sim_success = True
+            app.state.last_sim_policy_hash = "abc"
+            generic_imu = app.paths.repo_root / "ttyACM0"
+            generic_imu.write_text("", encoding="utf-8")
+
+            report = DoctorReport(
+                os_label="Ubuntu 24.04",
+                ubuntu_24_04=True,
+                ros_installed=True,
+                workspace_cloned=True,
+                workspace_built=True,
+                active_policy_label="公式デフォルト",
+                usb_policy_count=0,
+                tool_status={"slcand": True},
+            )
+            launched_jobs = []
+            with patch.object(app, "_confirm_no_conflicting_jobs", return_value=True), patch.object(
+                app,
+                "_select_can_mode",
+                return_value="serial",
+            ), patch(
+                "mujina_assist.app.build_doctor_report",
+                return_value=report,
+            ), patch(
+                "mujina_assist.app.ask_text",
+                return_value="REAL",
+            ), patch(
+                "mujina_assist.app.detect_real_devices",
+                return_value={
+                    "/dev/rt_usb_imu": False,
+                    "/dev/usb_can": True,
+                    "/dev/input/js0": True,
+                    "can0": False,
+                },
+            ), patch(
+                "mujina_assist.app.resolve_imu_port",
+                return_value=(str(generic_imu), True, [str(generic_imu)]),
+            ), patch.object(
+                app,
+                "_launch_job_group",
+                side_effect=lambda jobs, heading: launched_jobs.extend(jobs) or 0,
+            ), patch(
+                "mujina_assist.app.sim_policy_verified",
+                return_value=True,
+            ):
+                result = app.handle_real_robot()
+
+            self.assertEqual(result, 0)
+            imu_jobs = [job for job in launched_jobs if job.kind == "real_imu"]
+            self.assertEqual(len(imu_jobs), 1)
+            self.assertEqual(imu_jobs[0].payload["imu_port"], str(generic_imu))
 
     def test_prepare_candidate_for_job_caches_usb_policy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

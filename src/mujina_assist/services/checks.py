@@ -86,6 +86,16 @@ def list_serial_device_candidates(limit: int = 8) -> list[str]:
     return deduped[:limit]
 
 
+def resolve_imu_port() -> tuple[str | None, bool, list[str]]:
+    fixed = Path("/dev/rt_usb_imu")
+    if fixed.exists():
+        return str(fixed), False, []
+    candidates = list_serial_device_candidates()
+    if len(candidates) == 1:
+        return candidates[0], True, candidates
+    return None, False, candidates
+
+
 def real_setup_status() -> dict[str, bool]:
     in_dialout = False
     try:
@@ -145,6 +155,7 @@ def build_doctor_report(paths: AppPaths, state: RuntimeState) -> DoctorReport:
     sim_ready = sim_policy_verified(state)
     devices = detect_real_devices()
     serial_candidates = list_serial_device_candidates()
+    imu_port, imu_port_fallback, _imu_candidates = resolve_imu_port()
     real_setup = real_setup_status()
     tool_status = {
         "git": command_exists("git"),
@@ -197,6 +208,8 @@ def build_doctor_report(paths: AppPaths, state: RuntimeState) -> DoctorReport:
             "汎用 USB シリアル候補は見えていますが、期待する固定名デバイスが不足しています。"
             " 候補が IMU / USB-CAN のどちらかはこの CLI だけでは断定できません。"
         )
+    if imu_port_fallback and imu_port:
+        notes.append(f"IMU は固定名 `/dev/rt_usb_imu` の代わりに {imu_port} を候補として扱います。")
     if devices["/dev/usb_can"] and not tool_status["slcand"]:
         notes.append("serial CAN を使う構成では `slcand` が必要です。見つからない場合は `can-utils` を導入してください。")
 
@@ -211,6 +224,8 @@ def build_doctor_report(paths: AppPaths, state: RuntimeState) -> DoctorReport:
         sim_ready=sim_ready,
         real_devices=devices,
         serial_candidates=serial_candidates,
+        imu_port_label=imu_port or "",
+        imu_port_fallback=imu_port_fallback,
         tool_status=tool_status,
         notes=notes,
         recommendation=recommendation,

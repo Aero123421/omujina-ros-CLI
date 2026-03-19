@@ -35,12 +35,12 @@ def build_joy_script(paths: AppPaths) -> str:
     )
 
 
-def build_real_imu_script(paths: AppPaths) -> str:
+def build_real_imu_script(paths: AppPaths, port_name: str = "/dev/rt_usb_imu") -> str:
     return " && ".join(
         [
             ros_prefix(paths),
             f"cd {shell_quote(paths.workspace_dir)}",
-            'ros2 run rt_usb_imu_driver rt_usb_imu_driver --ros-args -p "port_name:=/dev/rt_usb_imu"',
+            f'ros2 run rt_usb_imu_driver rt_usb_imu_driver --ros-args -p "port_name:={port_name}"',
         ]
     )
 
