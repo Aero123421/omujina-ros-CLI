@@ -54,4 +54,8 @@ if [[ -f /etc/os-release ]]; then
   fi
 fi
 
-exec "${RUNNER[@]}" -m mujina_assist.main menu "$@"
+if [[ "$#" -eq 0 ]]; then
+  exec "${RUNNER[@]}" -m mujina_assist.main menu
+fi
+
+exec "${RUNNER[@]}" -m mujina_assist.main "$@"

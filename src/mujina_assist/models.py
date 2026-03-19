@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 
 @dataclass(slots=True)
 class AppPaths:
     repo_root: Path
     state_dir: Path
+    jobs_dir: Path
+    job_scripts_dir: Path
     cache_dir: Path
     imported_policy_dir: Path
     logs_dir: Path
@@ -21,6 +24,8 @@ class AppPaths:
     @classmethod
     def from_repo_root(cls, repo_root: Path) -> "AppPaths":
         state_dir = repo_root / ".state"
+        jobs_dir = state_dir / "jobs"
+        job_scripts_dir = state_dir / "job_scripts"
         cache_dir = repo_root / "cache"
         workspace_dir = repo_root / "workspace"
         workspace_src_dir = workspace_dir / "src"
@@ -30,6 +35,8 @@ class AppPaths:
         return cls(
             repo_root=repo_root,
             state_dir=state_dir,
+            jobs_dir=jobs_dir,
+            job_scripts_dir=job_scripts_dir,
             cache_dir=cache_dir,
             imported_policy_dir=imported_policy_dir,
             logs_dir=logs_dir,
@@ -44,6 +51,8 @@ class AppPaths:
     def ensure_directories(self) -> None:
         for path in (
             self.state_dir,
+            self.jobs_dir,
+            self.job_scripts_dir,
             self.cache_dir,
             self.imported_policy_dir,
             self.logs_dir,
@@ -67,6 +76,26 @@ class RuntimeState:
     last_sim_policy_hash: str = ""
     real_setup_requires_relogin: bool = False
     tmux_session_name: str = ""
+
+
+@dataclass(slots=True)
+class JobRecord:
+    job_id: str
+    kind: str
+    name: str
+    status: str
+    log_path: str
+    created_at: str
+    job_file: str
+    script_path: str
+    payload: dict[str, Any] = field(default_factory=dict)
+    terminal_mode: str = ""
+    group_id: str = ""
+    started_at: str = ""
+    finished_at: str = ""
+    returncode: int | None = None
+    message: str = ""
+    terminal_label: str = ""
 
 
 @dataclass(slots=True)

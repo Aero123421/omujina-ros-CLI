@@ -1,15 +1,52 @@
 from __future__ import annotations
 
 import argparse
+import traceback
 from pathlib import Path
+from uuid import uuid4
 
-from mujina_assist.models import AppPaths, PolicyCandidate
-from mujina_assist.services.checks import build_doctor_report, detect_real_devices, workspace_build_ready, workspace_clone_ready, write_config_file
-from mujina_assist.services.policy import activate_policy, all_policy_candidates
-from mujina_assist.services.processes import attach_tmux_session, kill_tmux_session, start_real_session, start_sim_session, tmux_available, tmux_session_dead_panes, tmux_session_exists
-from mujina_assist.services.shell import run_bash, shell_quote
+from mujina_assist.models import AppPaths, JobRecord, PolicyCandidate
+from mujina_assist.services.checks import (
+    build_doctor_report,
+    detect_real_devices,
+    workspace_build_ready,
+    workspace_clone_ready,
+    write_config_file,
+)
+from mujina_assist.services.jobs import (
+    active_jobs,
+    create_job,
+    job_log_path,
+    load_job,
+    mark_job_finished,
+    mark_job_running,
+    mark_job_stopped,
+    recent_jobs,
+    summarize_job,
+    update_job,
+)
+from mujina_assist.services.policy import activate_policy, all_policy_candidates, import_policy_to_cache
+from mujina_assist.services.processes import (
+    build_joy_script,
+    build_motor_read_script,
+    build_real_imu_script,
+    build_real_main_script,
+    build_sim_main_script,
+    build_viz_script,
+    build_zero_script,
+)
+from mujina_assist.services.shell import run_bash
 from mujina_assist.services.state import load_runtime_state, save_runtime_state
-from mujina_assist.services.workspace import capture_default_policy, ensure_upstream_clone, ros_prefix, run_initial_setup, run_onnx_self_test, run_real_device_setup, run_workspace_build, run_workspace_dependency_setup
+from mujina_assist.services.terminals import launch_job
+from mujina_assist.services.workspace import (
+    capture_default_policy,
+    ensure_upstream_clone,
+    run_initial_setup,
+    run_onnx_self_test,
+    run_real_device_setup,
+    run_workspace_build,
+    run_workspace_dependency_setup,
+)
 from mujina_assist.ui import ask_text, ask_yes_no, bullet, error, info, pause, section, select_from_list, success, title, warn
 
 
@@ -40,6 +77,19 @@ class MujinaAssistApp:
         bullet(f"実機デバイス: {real_devices}")
         tools = ", ".join([f"{name}={'OK' if ok else 'NG'}" for name, ok in report.tool_status.items()])
         bullet(f"主要ツール: {tools}")
+
+        running_jobs = active_jobs(self.paths)
+        if running_jobs:
+            section("実行中ジョブ")
+            for job in running_jobs[:5]:
+                bullet(f"{job.name} | ログ: {Path(job.log_path).name}")
+
+        latest_jobs = [job for job in recent_jobs(self.paths, limit=5) if job.status not in {"queued", "running"}]
+        if latest_jobs:
+            section("最近の完了ジョブ")
+            for job in latest_jobs[:3]:
+                bullet(summarize_job(job))
+
         section("おすすめ")
         bullet(report.recommendation)
         if report.notes:
@@ -62,7 +112,7 @@ class MujinaAssistApp:
                 "ONNX 読み込みテスト",
                 "モータの現在値を読む",
                 "初期位置を設定する",
-                "ログを見る",
+                "ジョブとログを見る",
                 "終了",
             ]
             selection = select_from_list("やりたいことを選んでください。", options)
@@ -99,217 +149,90 @@ class MujinaAssistApp:
 
     def handle_setup(self, skip_upgrade: bool = False) -> int:
         title("初回セットアップ")
+        if not self._confirm_no_conflicting_jobs({"setup", "build", "policy_switch"}):
+            return 1
+        bullet("メインCLIは司令塔のままにして、実処理は別ターミナルで流します。")
         bullet("ROS 2 Jazzy の導入確認")
         bullet("mujina_ros の clone")
         bullet("依存関係導入")
         bullet("build")
-        warn("途中で sudo パスワード入力が必要になることがあります。")
-        if not ask_yes_no("このまま実行しますか？"):
+        bullet("yes / Enter が必要な確認はここでまとめて済ませます。")
+        wants_real_setup = ask_yes_no("実機も使う予定なら dialout と udev ルールも一緒に設定しますか？", default=False)
+        if not ask_yes_no("この内容でセットアップジョブを起動しますか？", default=True):
             return 1
-
-        log_path = self.paths.logs_dir / "setup.log"
-        result = run_initial_setup(self.paths, log_path, skip_upgrade=skip_upgrade)
-        if result.returncode != 0:
-            self._report_failure(
-                "ROS 2 Jazzy の導入処理で失敗しました。",
-                log_path,
-                causes=[
-                    "ネットワーク接続が不安定です。",
-                    "sudo パスワード入力に失敗しています。",
-                    "Ubuntu 24.04 以外の環境で実行しています。",
-                ],
-                next_steps=[
-                    "まずログ末尾を確認してください。",
-                    "apt 系の失敗なら、ネットワークと sudo 権限を見直してから再実行してください。",
-                ],
-            )
-            return result.returncode
-
-        clone_result = ensure_upstream_clone(self.paths, log_path)
-        if clone_result.returncode != 0:
-            self._report_failure(
-                "mujina_ros の clone に失敗しました。",
-                log_path,
-                causes=[
-                    "GitHub へアクセスできません。",
-                    "git が導入されていないか、プロキシ設定が必要です。",
-                ],
-                next_steps=[
-                    "ネットワーク疎通を確認してください。",
-                    "必要ならあとで `ログを見る` から clone 部分を確認してください。",
-                ],
-            )
-            return clone_result.returncode
-
-        dependency_result = run_workspace_dependency_setup(self.paths, log_path)
-        if dependency_result.returncode != 0:
-            self._report_failure(
-                "依存関係の導入に失敗しました。",
-                log_path,
-                causes=[
-                    "apt か pip の導入で不足パッケージが残っています。",
-                    "Python パッケージ取得時にネットワークエラーが出ています。",
-                    "ディスク空き容量が不足しています。",
-                ],
-                next_steps=[
-                    "ログの `rosdep` / `pip` 周辺を確認してください。",
-                    "空き容量不足なら `~/.cache/pip` や途中でできた `.venv` / `workspace` を整理してから再実行してください。",
-                    "途中まで入っていれば、そのまま `初回セットアップ` を再実行して続きから復旧できることがあります。",
-                ],
-            )
-            return dependency_result.returncode
-
-        build_result = run_workspace_build(self.paths, log_path)
-        if build_result.returncode != 0:
-            self._report_failure(
-                "workspace build に失敗しました。",
-                log_path,
-                causes=[
-                    "ROS の source が不完全です。",
-                    "依存パッケージが一部不足しています。",
-                    "upstream 側の build 条件が変わっています。",
-                ],
-                next_steps=[
-                    "ログの末尾 40 行を優先して確認してください。",
-                    "必要なら `build する` を単体でもう一度試してください。",
-                ],
-            )
-            return build_result.returncode
-
-        capture_default_policy(self.paths)
-        self._sync_default_policy_state()
-        if ask_yes_no("実機も使う予定なら dialout と udev ルールを設定しますか？", default=False):
-            real_setup_result = run_real_device_setup(self.paths, log_path)
-            if real_setup_result.returncode != 0:
-                warn("実機用のデバイス設定は完了しませんでした。SIM や可視化はそのまま使えます。")
-            else:
-                self.state.real_setup_requires_relogin = True
-                warn("実機用のデバイス設定を反映するには、一度ログアウトして再ログインしてください。")
-
-        self.state.last_action = "setup"
-        self.state.last_sim_success = False
-        self.state.last_sim_policy_hash = ""
-        self.save_state()
-        success("初回セットアップが完了しました。")
-        bullet(f"ログ: {log_path}")
-        return 0
+        job = create_job(
+            self.paths,
+            kind="setup",
+            name="初回セットアップ",
+            payload={
+                "skip_upgrade": skip_upgrade,
+                "setup_real_devices": wants_real_setup,
+            },
+        )
+        return self._launch_job(job)
 
     def handle_build(self) -> int:
         title("build")
-        if not self.paths.upstream_dir.exists():
-            error("workspace がありません。先に初回セットアップを実行してください。")
+        if not self._require_cloned_workspace():
             return 1
-        log_path = self.paths.logs_dir / "build.log"
-        result = run_workspace_build(self.paths, log_path)
-        if result.returncode != 0:
-            self._report_failure(
-                "build に失敗しました。",
-                log_path,
-                causes=[
-                    "依存が不足しています。",
-                    "upstream のコード変更で build 条件が変わっています。",
-                ],
-                next_steps=[
-                    "`ログを見る` から build.log の末尾を確認してください。",
-                    "初回セットアップ直後なら、もう一度 `初回セットアップ` をやり直すと復旧することがあります。",
-                ],
-            )
-            return result.returncode
-        capture_default_policy(self.paths)
-        self._sync_default_policy_state()
-        self.state.last_action = "build"
-        self.state.last_sim_success = False
-        self.state.last_sim_policy_hash = ""
-        self.save_state()
-        success("build が完了しました。")
-        return 0
+        if not self._confirm_no_conflicting_jobs({"setup", "build", "policy_switch"}):
+            return 1
+        bullet("build は別ターミナルで実行します。")
+        if not ask_yes_no("build ジョブを起動しますか？", default=True):
+            return 1
+        job = create_job(
+            self.paths,
+            kind="build",
+            name="workspace build",
+        )
+        return self._launch_job(job)
 
     def handle_viz(self) -> int:
         title("可視化")
         if not self._require_built_workspace():
             return 1
-        info("これから RViz を起動してロボットの見た目を確認します。")
-        if not ask_yes_no("続けますか？", default=True):
+        if not self._confirm_no_conflicting_jobs({"viz"}):
             return 1
-        log_path = self.paths.logs_dir / "viz.log"
-        script = " && ".join(
-            [
-                ros_prefix(self.paths),
-                f"cd {shell_quote(self.paths.workspace_dir)}",
-                "ros2 launch mujina_description display.launch.py",
-            ]
+        bullet("RViz は別ターミナルで起動します。")
+        bullet("メニュー画面はこのまま残るので、必要なら状態確認やログ確認に戻れます。")
+        if not ask_yes_no("可視化ジョブを起動しますか？", default=True):
+            return 1
+        job = create_job(
+            self.paths,
+            kind="viz",
+            name="RViz 可視化",
         )
-        result = run_bash(script, cwd=self.paths.workspace_dir, log_path=log_path, interactive=True)
-        if result.returncode != 0:
-            self._report_failure(
-                "RViz の起動に失敗しました。",
-                log_path,
-                causes=[
-                    "GUI セッションではない端末から起動しています。",
-                    "ROS パッケージの build が途中で失敗しています。",
-                    "xacro や RViz 関連パッケージが不足しています。",
-                ],
-                next_steps=[
-                    "Ubuntu Desktop の画面上で実行しているか確認してください。",
-                    "必要なら `build する` を再実行してからやり直してください。",
-                ],
-            )
-        return result.returncode
+        return self._launch_job(job)
 
     def handle_sim(self) -> int:
         title("SIM")
         if not self._require_built_workspace():
             return 1
-        if not tmux_available():
-            warn("tmux が見つからないため、sim 本体だけを単独プロセスで起動します。")
-            bullet("この経路では joy ノードは自動起動しません。")
-            bullet("別ターミナルで使うコマンド: ros2 run joy_linux joy_linux_node")
-            log_path = self.paths.logs_dir / "sim.log"
-            script = " && ".join(
-                [
-                    ros_prefix(self.paths),
-                    f"cd {shell_quote(self.paths.workspace_dir)}",
-                    "ros2 run mujina_control mujina_main --sim",
-                ]
-            )
-            result = run_bash(script, cwd=self.paths.workspace_dir, log_path=log_path, interactive=True)
-            if result.returncode != 0:
-                self._report_failure(
-                    "SIM 起動に失敗しました。",
-                    log_path,
-                    causes=[
-                        "MuJoCo / ONNX Runtime の導入が不完全です。",
-                        "workspace の build が壊れています。",
-                        "policy.onnx の読み込みに失敗しています。",
-                    ],
-                    next_steps=[
-                        "メニューの `ONNX 読み込みテスト` を先に試してください。",
-                        "次に `build する` をやり直してから再試行してください。",
-                    ],
-                )
-            else:
-                bullet(f"ログ: {log_path}")
-        else:
-            session_name = "mujina-sim"
-            if tmux_session_exists(session_name):
-                if ask_yes_no("既存の sim セッションへそのまま戻りますか？", default=True):
-                    result_code = attach_tmux_session(session_name)
-                else:
-                    kill_tmux_session(session_name)
-                    result_code = start_sim_session(self.paths, session_name, with_joy=True)
-            else:
-                result_code = start_sim_session(self.paths, session_name, with_joy=True)
-            result = type("SimResult", (), {"returncode": result_code})()
-            self.state.tmux_session_name = session_name
-        self.state.last_action = "sim"
-        self.state.last_sim_success = result.returncode == 0
-        self.state.last_sim_policy_hash = self.state.active_policy_hash if result.returncode == 0 else ""
-        self.save_state()
-        return result.returncode
+        if not self._confirm_no_conflicting_jobs({"sim_main", "sim_joy"}):
+            return 1
+        bullet("SIM 本体と joy ノードを別ターミナルで起動します。")
+        bullet("先に ONNX 読み込みテストが通っていると安心です。")
+        if not ask_yes_no("SIM を起動しますか？", default=True):
+            return 1
+        group_id = f"sim-{uuid4().hex[:8]}"
+        jobs = [
+            create_job(self.paths, kind="sim_main", name="SIM 本体", group_id=group_id),
+            create_job(self.paths, kind="sim_joy", name="SIM 用 joy ノード", group_id=group_id),
+        ]
+        result = self._launch_job_group(jobs, heading="SIM ジョブを起動しました。")
+        if result == 0:
+            warn("実機へ進む前に、起動した別ターミナル側で姿勢と入力応答を実際に確認してください。")
+            self.state.last_action = "sim_launch"
+            self.state.last_sim_success = False
+            self.state.last_sim_policy_hash = ""
+            self.save_state()
+        return result
 
     def handle_real_robot(self, can_mode: str = "auto") -> int:
         title("実機起動")
         if not self._require_built_workspace():
+            return 1
+        if not self._confirm_no_conflicting_jobs({"real_imu", "real_main", "real_joy"}):
             return 1
         selected_can_mode = self._select_can_mode(can_mode)
         if selected_can_mode is None:
@@ -325,42 +248,41 @@ class MujinaAssistApp:
             )
             return 1
         if not self.state.last_sim_success or self.state.last_sim_policy_hash != self.state.active_policy_hash:
-            warn("まだこの policy での直前 SIM 成功が確認できていません。")
-            if not ask_yes_no("それでも実機起動へ進みますか？", default=False):
+            warn("今の policy で SIM 起動済みの記録がありません。")
+            bullet("実機へ進む前に、少なくとも一度は同じ policy で SIM を起動して挙動確認するのがおすすめです。")
+            if not ask_yes_no("それでも実機起動ジョブを起動しますか？", default=False):
                 return 1
         warn("この操作は実機を動かす可能性があります。")
-        bullet("tmux 上で IMU / CAN + mujina_main / joy ノードをまとめて起動します。")
-        bullet("停止するときは各ペインで Ctrl+C、または別端末から `tmux kill-session -t mujina-real` を使います。")
+        bullet("IMU / CAN + mujina_main / joy ノードを別ターミナルで起動します。")
+        bullet("すべての確認入力は今ここで済ませるので、ワーカー側で Enter 待ちは発生しません。")
         bullet("周囲を空け、補助者がロボット横で監視している状態で進めてください。")
-        bullet("SIM で確認済みでも、実機の安全は保証されません。")
         typed = ask_text("本当に実行する場合だけ REAL と入力してください。")
         if typed != "REAL":
             warn("実機起動を中止しました。")
             return 1
-        if not tmux_available():
-            error("実機起動は tmux 前提で実装しています。tmux を導入してください。")
-            return 1
-        session_name = "mujina-real"
-        if tmux_session_exists(session_name):
-            if ask_yes_no("既存の実機セッションへそのまま戻りますか？", default=True):
-                result_code = attach_tmux_session(session_name)
-            else:
-                kill_tmux_session(session_name)
-                result_code = start_real_session(self.paths, session_name, can_mode=selected_can_mode)
-        else:
-            result_code = start_real_session(self.paths, session_name, can_mode=selected_can_mode)
-        if result_code == 0 and tmux_session_dead_panes(session_name) > 0:
-            warn("tmux セッションは作れましたが、起動直後に落ちたペインがあります。")
-            bullet("各ペインのログを確認してください。")
-            result_code = 1
-        self.state.tmux_session_name = session_name
-        self.state.last_action = "real"
-        self.save_state()
-        return result_code
+        group_id = f"real-{uuid4().hex[:8]}"
+        jobs = [
+            create_job(self.paths, kind="real_imu", name="実機 IMU ノード", group_id=group_id),
+            create_job(
+                self.paths,
+                kind="real_main",
+                name="実機 mujina_main",
+                group_id=group_id,
+                payload={"can_mode": selected_can_mode},
+            ),
+            create_job(self.paths, kind="real_joy", name="実機 joy ノード", group_id=group_id),
+        ]
+        result = self._launch_job_group(jobs, heading="実機ジョブを起動しました。")
+        if result == 0:
+            self.state.last_action = "real"
+            self.save_state()
+        return result
 
     def handle_policy_menu(self) -> int:
         title("ポリシー切り替え")
         if not self._require_built_workspace():
+            return 1
+        if not self._confirm_no_conflicting_jobs({"setup", "build", "policy_switch", "sim_main", "real_main"}):
             return 1
         capture_default_policy(self.paths)
         candidates = all_policy_candidates(self.paths)
@@ -380,33 +302,39 @@ class MujinaAssistApp:
             )
         else:
             candidate = candidates[selected]
-        log_path = self.paths.logs_dir / "policy.log"
-        ok, message = activate_policy(self.paths, self.state, candidate, log_path)
-        if ok:
-            self.state.last_sim_success = False
-            self.state.last_sim_policy_hash = ""
-            self.save_state()
-            success(message)
-            bullet("この後はまず SIM で確認するのがおすすめです。")
-            bullet("必要ならメニューの `ONNX 読み込みテスト` で先に形式確認ができます。")
-            return 0
-        self._report_failure(
-            message,
-            log_path,
-            causes=[
-                "選んだ ONNX が mujina_ros 想定の入出力 shape と合っていません。",
-                "再 build か ONNX 読み込みテストで失敗しています。",
-            ],
-            next_steps=[
-                "まずログの末尾を確認してください。",
-                "失敗時はひとつ前の policy へ自動で戻すようにしてあります。",
-            ],
+        candidate = self._prepare_candidate_for_job(candidate)
+        bullet("差し替え・再 build・ONNX 読み込みテストは別ターミナルでまとめて実行します。")
+        if not ask_yes_no("この policy へ切り替えますか？", default=True):
+            return 1
+        job = create_job(
+            self.paths,
+            kind="policy_switch",
+            name=f"policy 切替: {candidate.label}",
+            payload=self._candidate_to_payload(candidate),
         )
-        return 1
+        return self._launch_job(job)
+
+    def handle_policy_test(self) -> int:
+        title("ONNX 読み込みテスト")
+        if not self._require_built_workspace():
+            return 1
+        if not self._confirm_no_conflicting_jobs({"policy_test"}):
+            return 1
+        bullet("現在の active policy を別ターミナルで読み込みテストします。")
+        if not ask_yes_no("ONNX 読み込みテストを起動しますか？", default=True):
+            return 1
+        job = create_job(
+            self.paths,
+            kind="policy_test",
+            name="ONNX 読み込みテスト",
+        )
+        return self._launch_job(job)
 
     def handle_motor_read(self, ids: list[int] | None = None, can_mode: str = "auto") -> int:
         title("モータ確認")
         if not self._require_built_workspace():
+            return 1
+        if not self._confirm_no_conflicting_jobs({"motor_read", "zero"}):
             return 1
         selected_can_mode = self._select_can_mode(can_mode)
         if selected_can_mode is None:
@@ -426,30 +354,21 @@ class MujinaAssistApp:
             error("ID が指定されていません。")
             return 1
         warn("この操作は読み取り専用ですが、CAN 通信を使います。")
-        if not ask_yes_no("続けますか？", default=False):
+        if not ask_yes_no("モータ確認ジョブを起動しますか？", default=True):
             return 1
-        script = self._build_motor_read_script(ids, selected_can_mode)
-        log_path = self.paths.logs_dir / "motor-read.log"
-        result = run_bash(script, cwd=self.paths.workspace_dir, log_path=log_path, interactive=True)
-        if result.returncode != 0:
-            self._report_failure(
-                "モータ読み取りに失敗しました。",
-                log_path,
-                causes=[
-                    "CAN 接続方式の選択が実機と合っていません。",
-                    "can0 または /dev/usb_can の準備が不十分です。",
-                    "対象 ID のモータが見えていません。",
-                ],
-                next_steps=[
-                    "接続方式を確認してから再実行してください。",
-                    "必要なら `実機` メニュー前に device 設定や CAN 設定を見直してください。",
-                ],
-            )
-        return result.returncode
+        job = create_job(
+            self.paths,
+            kind="motor_read",
+            name=f"モータ確認 ({' '.join(str(i) for i in ids)})",
+            payload={"ids": ids, "can_mode": selected_can_mode},
+        )
+        return self._launch_job(job)
 
     def handle_zero_position(self, ids: list[int] | None = None, can_mode: str = "auto") -> int:
         title("初期位置設定")
         if not self._require_built_workspace():
+            return 1
+        if not self._confirm_no_conflicting_jobs({"motor_read", "zero", "real_main"}):
             return 1
         selected_can_mode = self._select_can_mode(can_mode)
         if selected_can_mode is None:
@@ -467,7 +386,7 @@ class MujinaAssistApp:
         warn("この操作はモータ原点を変更します。姿勢が誤っていると危険です。")
         bullet("README 記載の原点姿勢になっていることを確認してください。")
         bullet("補助者がいる状態で実行してください。")
-        bullet("停止ややり直しが難しい操作なので、不安があればここで中止してください。")
+        bullet("前提確認として read-only 通信テストもワーカー側で自動実行します。")
         typed = ask_text("本当に実行する場合だけ ZERO と入力してください。")
         if typed != "ZERO":
             warn("初期位置設定を中止しました。")
@@ -476,9 +395,354 @@ class MujinaAssistApp:
         if not ids:
             error("ID が指定されていません。")
             return 1
-        preflight_script = self._build_motor_read_script(ids, selected_can_mode)
+        job = create_job(
+            self.paths,
+            kind="zero",
+            name=f"初期位置設定 ({' '.join(str(i) for i in ids)})",
+            payload={"ids": ids, "can_mode": selected_can_mode},
+        )
+        return self._launch_job(job)
+
+    def handle_logs(self) -> int:
+        title("ジョブとログ")
+        jobs = recent_jobs(self.paths, limit=10)
+        if jobs:
+            section("最近のジョブ")
+            for job in jobs:
+                bullet(f"{summarize_job(job)} | ログ: {Path(job.log_path).name}")
+        else:
+            warn("まだジョブ履歴がありません。")
+        log_files = sorted(self.paths.logs_dir.glob("*.log"), reverse=True)
+        if not log_files:
+            warn("まだログがありません。")
+            return 0
+        options = [f"{log_file.name} ({log_file.stat().st_size} bytes)" for log_file in log_files]
+        selected = select_from_list("末尾を表示したいログを選んでください。", options)
+        target = log_files[selected]
+        section(f"{target.name} の末尾")
+        content = target.read_text(encoding="utf-8", errors="ignore").splitlines()
+        for line in content[-40:]:
+            info(line)
+        return 0
+
+    def run_worker(self, job_file: Path) -> int:
+        job = load_job(job_file)
+        mark_job_running(job)
+        try:
+            returncode, message, allow_sigint_stop = self._dispatch_worker_job(job)
+        except Exception as exc:  # pragma: no cover - defensive path
+            log_path = job_log_path(job)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write("\n[worker exception]\n")
+                handle.write("".join(traceback.format_exception(exc)))
+            error("ワーカージョブ内部で予期しない例外が発生しました。")
+            bullet(f"ログ: {log_path}")
+            mark_job_finished(job, returncode=1, message=str(exc))
+            return 1
+
+        if allow_sigint_stop and returncode == 130:
+            mark_job_stopped(job, returncode=returncode, message=message)
+        else:
+            mark_job_finished(job, returncode=returncode, message=message)
+        return returncode
+
+    def _dispatch_worker_job(self, job: JobRecord) -> tuple[int, str, bool]:
+        payload = job.payload
+        if job.kind == "setup":
+            return self._execute_setup_job(job, payload.get("skip_upgrade", False), payload.get("setup_real_devices", False))
+        if job.kind == "build":
+            return self._execute_build_job(job)
+        if job.kind == "viz":
+            return self._execute_shell_job(
+                job,
+                build_viz_script(self.paths),
+                "RViz を閉じました。",
+                causes=[
+                    "GUI セッションではない端末から起動しています。",
+                    "ROS パッケージの build が途中で失敗しています。",
+                    "xacro や RViz 関連パッケージが不足しています。",
+                ],
+                next_steps=[
+                    "Ubuntu Desktop の画面上で実行しているか確認してください。",
+                    "必要なら `build する` を再実行してからやり直してください。",
+                ],
+                allow_sigint_stop=True,
+            )
+        if job.kind == "sim_main":
+            return self._execute_shell_job(
+                job,
+                build_sim_main_script(self.paths),
+                "SIM 本体を停止しました。",
+                causes=[
+                    "MuJoCo / ONNX Runtime の導入が不完全です。",
+                    "workspace の build が壊れています。",
+                    "policy.onnx の読み込みに失敗しています。",
+                ],
+                next_steps=[
+                    "メニューの `ONNX 読み込みテスト` を先に試してください。",
+                    "次に `build する` をやり直してから再試行してください。",
+                ],
+                allow_sigint_stop=True,
+            )
+        if job.kind == "sim_joy":
+            return self._execute_shell_job(
+                job,
+                build_joy_script(self.paths),
+                "SIM 用 joy ノードを停止しました。",
+                causes=[
+                    "joy_linux パッケージが不足しています。",
+                    "ゲームパッドが接続されていません。",
+                ],
+                next_steps=[
+                    "ゲームパッド接続を確認してください。",
+                ],
+                allow_sigint_stop=True,
+            )
+        if job.kind == "real_imu":
+            return self._execute_shell_job(
+                job,
+                build_real_imu_script(self.paths),
+                "実機 IMU ノードを停止しました。",
+                causes=[
+                    "IMU デバイスが見えていません。",
+                    "udev 設定や再ログインがまだです。",
+                ],
+                next_steps=[
+                    "`doctor` で /dev/rt_usb_imu を確認してください。",
+                ],
+                allow_sigint_stop=True,
+            )
+        if job.kind == "real_main":
+            can_mode = payload.get("can_mode", "net")
+            return self._execute_shell_job(
+                job,
+                build_real_main_script(self.paths, can_mode),
+                "実機 mujina_main を停止しました。",
+                causes=[
+                    "CAN 接続方式の選択が実機と合っていません。",
+                    "can0 または /dev/usb_can の準備が不十分です。",
+                    "policy.onnx の読み込みに失敗しています。",
+                ],
+                next_steps=[
+                    "必要なら CAN モードを見直して再実行してください。",
+                    "まず `ONNX 読み込みテスト` と `SIM` を確認してください。",
+                ],
+                allow_sigint_stop=True,
+            )
+        if job.kind == "real_joy":
+            return self._execute_shell_job(
+                job,
+                build_joy_script(self.paths),
+                "実機 joy ノードを停止しました。",
+                causes=[
+                    "joy_linux パッケージが不足しています。",
+                    "ゲームパッドが接続されていません。",
+                ],
+                next_steps=[
+                    "ゲームパッド接続を確認してください。",
+                ],
+                allow_sigint_stop=True,
+            )
+        if job.kind == "policy_switch":
+            return self._execute_policy_switch_job(job)
+        if job.kind == "policy_test":
+            return self._execute_policy_test_job(job)
+        if job.kind == "motor_read":
+            ids = [int(value) for value in payload.get("ids", [])]
+            can_mode = payload.get("can_mode", "net")
+            return self._execute_shell_job(
+                job,
+                build_motor_read_script(self.paths, ids, can_mode),
+                "モータ読み取りが完了しました。",
+                causes=[
+                    "CAN 接続方式の選択が実機と合っていません。",
+                    "can0 または /dev/usb_can の準備が不十分です。",
+                    "対象 ID のモータが見えていません。",
+                ],
+                next_steps=[
+                    "接続方式を確認してから再実行してください。",
+                ],
+                allow_sigint_stop=False,
+            )
+        if job.kind == "zero":
+            return self._execute_zero_job(job)
+        error(f"未対応のジョブ種別です: {job.kind}")
+        return 1, f"unsupported job kind: {job.kind}", False
+
+    def _execute_setup_job(self, job: JobRecord, skip_upgrade: bool, setup_real_devices: bool) -> tuple[int, str, bool]:
+        title("初回セットアップ")
+        log_path = job_log_path(job)
+        result = run_initial_setup(self.paths, log_path, skip_upgrade=skip_upgrade)
+        if result.returncode != 0:
+            self._report_failure(
+                "ROS 2 Jazzy の導入処理で失敗しました。",
+                log_path,
+                causes=[
+                    "ネットワーク接続が不安定です。",
+                    "sudo パスワード入力に失敗しています。",
+                    "Ubuntu 24.04 以外の環境で実行しています。",
+                ],
+                next_steps=[
+                    "まずログ末尾を確認してください。",
+                    "apt 系の失敗なら、ネットワークと sudo 権限を見直してから再実行してください。",
+                ],
+            )
+            return result.returncode, "初回セットアップに失敗しました。", False
+
+        clone_result = ensure_upstream_clone(self.paths, log_path)
+        if clone_result.returncode != 0:
+            self._report_failure(
+                "mujina_ros の clone に失敗しました。",
+                log_path,
+                causes=[
+                    "GitHub へアクセスできません。",
+                    "git が導入されていないか、プロキシ設定が必要です。",
+                ],
+                next_steps=[
+                    "ネットワーク疎通を確認してください。",
+                ],
+            )
+            return clone_result.returncode, "mujina_ros の clone に失敗しました。", False
+
+        dependency_result = run_workspace_dependency_setup(self.paths, log_path)
+        if dependency_result.returncode != 0:
+            self._report_failure(
+                "依存関係の導入に失敗しました。",
+                log_path,
+                causes=[
+                    "apt か pip の導入で不足パッケージが残っています。",
+                    "Python パッケージ取得時にネットワークエラーが出ています。",
+                    "ディスク空き容量が不足しています。",
+                ],
+                next_steps=[
+                    "ログの `rosdep` / `pip` 周辺を確認してください。",
+                    "空き容量不足なら `~/.cache/pip` などを整理してから再実行してください。",
+                ],
+            )
+            return dependency_result.returncode, "依存関係の導入に失敗しました。", False
+
+        build_result = run_workspace_build(self.paths, log_path)
+        if build_result.returncode != 0:
+            self._report_failure(
+                "workspace build に失敗しました。",
+                log_path,
+                causes=[
+                    "ROS の source が不完全です。",
+                    "依存パッケージが一部不足しています。",
+                    "upstream 側の build 条件が変わっています。",
+                ],
+                next_steps=[
+                    "ログの末尾 40 行を優先して確認してください。",
+                    "必要なら `build する` を単体でもう一度試してください。",
+                ],
+            )
+            return build_result.returncode, "workspace build に失敗しました。", False
+
+        capture_default_policy(self.paths)
+        self._sync_default_policy_state()
+        if setup_real_devices:
+            real_setup_result = run_real_device_setup(self.paths, log_path)
+            if real_setup_result.returncode != 0:
+                warn("実機用のデバイス設定は完了しませんでした。SIM や可視化はそのまま使えます。")
+            else:
+                self.state.real_setup_requires_relogin = True
+                warn("実機用のデバイス設定を反映するには、一度ログアウトして再ログインしてください。")
+
+        self.state.last_action = "setup"
+        self.state.last_sim_success = False
+        self.state.last_sim_policy_hash = ""
+        self.save_state()
+        success("初回セットアップが完了しました。")
+        bullet(f"ログ: {log_path}")
+        return 0, "初回セットアップが完了しました。", False
+
+    def _execute_build_job(self, job: JobRecord) -> tuple[int, str, bool]:
+        title("build")
+        log_path = job_log_path(job)
+        result = run_workspace_build(self.paths, log_path)
+        if result.returncode != 0:
+            self._report_failure(
+                "build に失敗しました。",
+                log_path,
+                causes=[
+                    "依存が不足しています。",
+                    "upstream のコード変更で build 条件が変わっています。",
+                ],
+                next_steps=[
+                    "`ジョブとログを見る` から build.log の末尾を確認してください。",
+                    "初回セットアップ直後なら、もう一度 `初回セットアップ` をやり直すと復旧することがあります。",
+                ],
+            )
+            return result.returncode, "build に失敗しました。", False
+        capture_default_policy(self.paths)
+        self._sync_default_policy_state()
+        self.state.last_action = "build"
+        self.state.last_sim_success = False
+        self.state.last_sim_policy_hash = ""
+        self.save_state()
+        success("build が完了しました。")
+        return 0, "build が完了しました。", False
+
+    def _execute_policy_switch_job(self, job: JobRecord) -> tuple[int, str, bool]:
+        title("ポリシー切り替え")
+        candidate = self._candidate_from_payload(job.payload)
+        log_path = job_log_path(job)
+        ok, message = activate_policy(self.paths, self.state, candidate, log_path)
+        if ok:
+            self.state.last_sim_success = False
+            self.state.last_sim_policy_hash = ""
+            self.save_state()
+            success(message)
+            bullet("この後はまず SIM で確認するのがおすすめです。")
+            bullet("必要ならメニューの `ONNX 読み込みテスト` で先に形式確認ができます。")
+            return 0, message, False
+        self._report_failure(
+            message,
+            log_path,
+            causes=[
+                "選んだ ONNX が mujina_ros 想定の入出力 shape と合っていません。",
+                "再 build か ONNX 読み込みテストで失敗しています。",
+            ],
+            next_steps=[
+                "まずログの末尾を確認してください。",
+                "失敗時はひとつ前の policy へ自動で戻すようにしてあります。",
+            ],
+        )
+        return 1, message, False
+
+    def _execute_policy_test_job(self, job: JobRecord) -> tuple[int, str, bool]:
+        title("ONNX 読み込みテスト")
+        log_path = job_log_path(job)
+        result = run_onnx_self_test(self.paths, log_path)
+        if result.returncode == 0:
+            success("ONNX 読み込みテストに成功しました。")
+            return 0, "ONNX 読み込みテストに成功しました。", False
+        self._report_failure(
+            "ONNX 読み込みテストに失敗しました。",
+            log_path,
+            causes=[
+                "policy.onnx の形式や shape が合っていません。",
+                "onnxruntime の導入が不完全です。",
+            ],
+            next_steps=[
+                "まずログの末尾を確認してください。",
+                "必要なら別の policy を選び直してください。",
+            ],
+        )
+        return result.returncode, "ONNX 読み込みテストに失敗しました。", False
+
+    def _execute_zero_job(self, job: JobRecord) -> tuple[int, str, bool]:
+        title("初期位置設定")
+        ids = [int(value) for value in job.payload.get("ids", [])]
+        can_mode = job.payload.get("can_mode", "net")
         preflight_log_path = self.paths.logs_dir / "motor-zero-preflight.log"
-        preflight_result = run_bash(preflight_script, cwd=self.paths.workspace_dir, log_path=preflight_log_path, interactive=True)
+        preflight_result = run_bash(
+            build_motor_read_script(self.paths, ids, can_mode),
+            cwd=self.paths.workspace_dir,
+            log_path=preflight_log_path,
+            interactive=True,
+        )
         if preflight_result.returncode != 0:
             self._report_failure(
                 "原点設定の前提確認に失敗しました。",
@@ -492,102 +756,98 @@ class MujinaAssistApp:
                     "成功してから改めて `初期位置設定` を実行してください。",
                 ],
             )
-            return preflight_result.returncode
-        can_script = "./mujina_control/scripts/can_setup_serial.sh" if selected_can_mode == "serial" else "./mujina_control/scripts/can_setup_net.sh"
-        script = " && ".join(
-            [
-                ros_prefix(self.paths),
-                f"cd {shell_quote(self.paths.upstream_dir)}",
-                can_script,
-                "python3 mujina_control/scripts/motor_set_zero_position.py --ids " + " ".join(str(i) for i in ids),
-            ]
+            return preflight_result.returncode, "原点設定の前提確認に失敗しました。", False
+        return self._execute_shell_job(
+            job,
+            build_zero_script(self.paths, ids, can_mode),
+            "初期位置設定が完了しました。",
+            causes=[
+                "CAN 接続方式の選択が合っていません。",
+                "対象 ID のモータへ通信できていません。",
+                "実機姿勢が正しくなく、途中でエラーになっています。",
+            ],
+            next_steps=[
+                "姿勢確認をやり直してから再実行してください。",
+                "不安があれば motor read で先に通信だけ確認してください。",
+            ],
+            allow_sigint_stop=False,
         )
-        log_path = self.paths.logs_dir / "motor-zero.log"
+
+    def _execute_shell_job(
+        self,
+        job: JobRecord,
+        script: str,
+        success_message: str,
+        *,
+        causes: list[str],
+        next_steps: list[str],
+        allow_sigint_stop: bool,
+    ) -> tuple[int, str, bool]:
+        log_path = job_log_path(job)
         result = run_bash(script, cwd=self.paths.workspace_dir, log_path=log_path, interactive=True)
-        if result.returncode != 0:
-            self._report_failure(
-                "初期位置設定に失敗しました。",
-                log_path,
-                causes=[
-                    "CAN 接続方式の選択が合っていません。",
-                    "対象 ID のモータへ通信できていません。",
-                    "実機姿勢が正しくなく、途中でエラーになっています。",
-                ],
-                next_steps=[
-                    "姿勢確認をやり直してから再実行してください。",
-                    "不安があれば motor read で先に通信だけ確認してください。",
-                ],
-            )
-        return result.returncode
-
-    def handle_policy_test(self) -> int:
-        title("ONNX 読み込みテスト")
-        if not self._require_built_workspace():
-            return 1
-        log_path = self.paths.logs_dir / "policy-test.log"
-        result = run_onnx_self_test(self.paths, log_path)
         if result.returncode == 0:
-            success("ONNX 読み込みテストに成功しました。")
+            success(success_message)
+            bullet(f"ログ: {log_path}")
+            return 0, success_message, allow_sigint_stop
+        if allow_sigint_stop and result.returncode == 130:
+            warn("ジョブは Ctrl+C で停止されました。")
+            bullet(f"ログ: {log_path}")
+            return 130, "ユーザー操作で停止しました。", True
+        self._report_failure(
+            f"{job.name} に失敗しました。",
+            log_path,
+            causes=causes,
+            next_steps=next_steps,
+        )
+        return result.returncode, f"{job.name} に失敗しました。", allow_sigint_stop
+
+    def _launch_job(self, job: JobRecord) -> int:
+        launch = launch_job(self.paths, job)
+        if not launch.ok:
+            mark_job_finished(job, returncode=1, message=launch.message)
+            error("ジョブの起動に失敗しました。")
+            bullet(launch.message)
+            bullet(f"ログ予定先: {job.log_path}")
+            return 1
+        update_job(job, terminal_mode=launch.mode, terminal_label=launch.label)
+        success(launch.message)
+        bullet(f"ジョブ: {job.name}")
+        bullet(f"ログ: {job.log_path}")
+        if launch.mode == "tmux":
+            bullet(f"確認コマンド: tmux attach -t {launch.label}")
         else:
-            self._report_failure(
-                "ONNX 読み込みテストに失敗しました。",
-                log_path,
-                causes=[
-                    "policy.onnx の形式や shape が合っていません。",
-                    "onnxruntime の導入が不完全です。",
-                ],
-                next_steps=[
-                    "まずログの末尾を確認してください。",
-                    "必要なら別の policy を選び直してください。",
-                ],
-            )
-        return result.returncode
-
-    def _ask_ids(self) -> list[int]:
-        raw = ask_text("対象の motor ID を空白またはカンマ区切りで入力してください。例: 1 2 3 / 1,2,3")
-        normalized = raw.replace(",", " ")
-        tokens = [chunk for chunk in normalized.split() if chunk]
-        if not tokens:
-            return []
-        invalid = [chunk for chunk in tokens if not chunk.isdigit()]
-        if invalid:
-            error("ID の入力に数字以外が含まれています。")
-            bullet(f"解釈できなかった値: {', '.join(invalid)}")
-            return []
-        values = [int(chunk) for chunk in tokens]
-        bullet("対象 ID: " + " ".join(str(value) for value in values))
-        if not ask_yes_no("この ID で続けますか？", default=True):
-            warn("ID 入力をやり直してください。")
-            return []
-        return values
-
-    def _sync_default_policy_state(self) -> None:
-        if not self.paths.source_policy_path.exists():
-            return
-        if self.paths.default_policy_cache.exists():
-            self.state.active_policy_label = "公式デフォルト"
-            self.state.active_policy_source = str(self.paths.default_policy_cache)
-        try:
-            from mujina_assist.services.checks import file_hash
-
-            self.state.active_policy_hash = file_hash(self.paths.source_policy_path)
-        except Exception:
-            self.state.active_policy_hash = ""
-
-    def handle_logs(self) -> int:
-        title("ログ表示")
-        log_files = sorted(self.paths.logs_dir.glob("*.log"))
-        if not log_files:
-            warn("まだログがありません。")
-            return 0
-        options = [f"{log_file.name} ({log_file.stat().st_size} bytes)" for log_file in log_files]
-        selected = select_from_list("表示したいログを選んでください。", options)
-        target = log_files[selected]
-        section(f"{target.name} の末尾")
-        content = target.read_text(encoding="utf-8", errors="ignore").splitlines()
-        for line in content[-40:]:
-            info(line)
+            bullet("別ターミナルで実ログが流れます。メニュー画面はこのまま使えます。")
         return 0
+
+    def _launch_job_group(self, jobs: list[JobRecord], *, heading: str) -> int:
+        launches: list[tuple[JobRecord, str, str]] = []
+        for job in jobs:
+            launch = launch_job(self.paths, job)
+            if not launch.ok:
+                mark_job_finished(job, returncode=1, message=launch.message)
+                error("ジョブグループの起動途中で失敗しました。")
+                bullet(f"失敗したジョブ: {job.name}")
+                bullet(launch.message)
+                return 1
+            update_job(job, terminal_mode=launch.mode, terminal_label=launch.label)
+            launches.append((job, launch.mode, launch.label))
+        success(heading)
+        for job, mode, label in launches:
+            bullet(f"{job.name} | ログ: {job.log_path}")
+            if mode == "tmux":
+                bullet(f"tmux attach -t {label}")
+        if any(mode == "terminal" for _, mode, _ in launches):
+            bullet("各ジョブは別ターミナルで動いています。停止はそれぞれの端末で Ctrl+C を使ってください。")
+        return 0
+
+    def _confirm_no_conflicting_jobs(self, relevant_kinds: set[str]) -> bool:
+        conflicts = [job for job in active_jobs(self.paths) if job.kind in relevant_kinds]
+        if not conflicts:
+            return True
+        warn("同系統のジョブがまだ実行中です。")
+        for job in conflicts:
+            bullet(f"{job.name} | ログ: {Path(job.log_path).name}")
+        return ask_yes_no("それでも新しいジョブを起動しますか？", default=False)
 
     def _require_cloned_workspace(self) -> bool:
         if workspace_clone_ready(self.paths):
@@ -666,15 +926,66 @@ class MujinaAssistApp:
         if include_joy and "/dev/input/js0" in missing:
             bullet("ゲームパッドをつなぎ直し、OS から認識されていることを確認してください。")
 
-    def _build_motor_read_script(self, ids: list[int], can_mode: str) -> str:
-        can_script = "./mujina_control/scripts/can_setup_serial.sh" if can_mode == "serial" else "./mujina_control/scripts/can_setup_net.sh"
-        return " && ".join(
-            [
-                ros_prefix(self.paths),
-                f"cd {shell_quote(self.paths.upstream_dir)}",
-                can_script,
-                "python3 mujina_control/scripts/motor_test_read_only.py --ids " + " ".join(str(i) for i in ids),
-            ]
+    def _ask_ids(self) -> list[int]:
+        raw = ask_text("対象の motor ID を空白またはカンマ区切りで入力してください。例: 1 2 3 / 1,2,3")
+        normalized = raw.replace(",", " ")
+        tokens = [chunk for chunk in normalized.split() if chunk]
+        if not tokens:
+            return []
+        invalid = [chunk for chunk in tokens if not chunk.isdigit()]
+        if invalid:
+            error("ID の入力に数字以外が含まれています。")
+            bullet(f"解釈できなかった値: {', '.join(invalid)}")
+            return []
+        values = [int(chunk) for chunk in tokens]
+        bullet("対象 ID: " + " ".join(str(value) for value in values))
+        if not ask_yes_no("この ID で続けますか？", default=True):
+            warn("ID 入力をやり直してください。")
+            return []
+        return values
+
+    def _sync_default_policy_state(self) -> None:
+        if not self.paths.source_policy_path.exists():
+            return
+        if self.paths.default_policy_cache.exists():
+            self.state.active_policy_label = "公式デフォルト"
+            self.state.active_policy_source = str(self.paths.default_policy_cache)
+        try:
+            from mujina_assist.services.checks import file_hash
+
+            self.state.active_policy_hash = file_hash(self.paths.source_policy_path)
+        except Exception:
+            self.state.active_policy_hash = ""
+
+    def _candidate_to_payload(self, candidate: PolicyCandidate) -> dict[str, str]:
+        return {
+            "label": candidate.label,
+            "path": str(candidate.path),
+            "source_type": candidate.source_type,
+            "description": candidate.description,
+            "manifest_path": str(candidate.manifest_path) if candidate.manifest_path else "",
+        }
+
+    def _prepare_candidate_for_job(self, candidate: PolicyCandidate) -> PolicyCandidate:
+        if candidate.source_type in {"default", "cache"}:
+            return candidate
+        cached_path = import_policy_to_cache(self.paths, candidate)
+        return PolicyCandidate(
+            label=candidate.label,
+            path=cached_path,
+            source_type="cache",
+            description=candidate.description,
+            manifest_path=None,
+        )
+
+    def _candidate_from_payload(self, payload: dict) -> PolicyCandidate:
+        manifest_path = payload.get("manifest_path") or None
+        return PolicyCandidate(
+            label=str(payload.get("label", "policy")),
+            path=Path(str(payload.get("path", ""))),
+            source_type=str(payload.get("source_type", "path")),
+            description=str(payload.get("description", "")),
+            manifest_path=Path(manifest_path) if manifest_path else None,
         )
 
     def _report_failure(
@@ -726,6 +1037,9 @@ def build_parser() -> argparse.ArgumentParser:
     zero_parser.add_argument("--ids", nargs="+", type=int)
     zero_parser.add_argument("--can-mode", choices=["auto", "net", "serial"], default="auto")
 
+    worker_parser = subparsers.add_parser("worker")
+    worker_parser.add_argument("--job-file", required=True)
+
     return parser
 
 
@@ -757,6 +1071,8 @@ def run_app(repo_root: Path, argv: list[str] | None = None) -> int:
         return app.handle_motor_read(ids=args.ids, can_mode=args.can_mode)
     if command == "zero":
         return app.handle_zero_position(ids=args.ids, can_mode=args.can_mode)
+    if command == "worker":
+        return app.run_worker(Path(args.job_file))
 
     parser.print_help()
     return 1

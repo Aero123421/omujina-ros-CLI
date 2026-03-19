@@ -119,6 +119,7 @@ def build_doctor_report(paths: AppPaths, state: RuntimeState) -> DoctorReport:
     tool_status = {
         "git": command_exists("git"),
         "bash": command_exists("bash"),
+        "terminal": graphical_terminal_available(),
         "tmux": command_exists("tmux"),
         "colcon": command_exists("colcon"),
         "rosdep": command_exists("rosdep"),
@@ -144,8 +145,10 @@ def build_doctor_report(paths: AppPaths, state: RuntimeState) -> DoctorReport:
         recommendation = "実機起動前チェックは良好です。"
     else:
         recommendation = "可視化または SIM から試すのがおすすめです。"
-    if workspace_built and not tool_status["tmux"]:
-        notes.append("tmux が無い場合、SIM は単独起動になります。実機起動は tmux が必要です。")
+    if workspace_built and not tool_status["terminal"] and not tool_status["tmux"]:
+        notes.append("GUI ターミナルも tmux も無いため、別ウィンドウ起動ができません。どちらかを導入してください。")
+    elif workspace_built and not tool_status["terminal"] and tool_status["tmux"]:
+        notes.append("GUI ターミナルが無い環境では tmux をフォールバックに使います。")
     if state.last_action == "policy_switch" and not state.last_sim_success:
         notes.append("policy を切り替えた直後です。まずは SIM と ONNX テストで確認してください。")
     if state.real_setup_requires_relogin and real_setup["udev_rule"] and not real_setup["dialout"]:
@@ -183,3 +186,10 @@ def write_config_file(paths: AppPaths) -> None:
 
 def command_exists(name: str) -> bool:
     return shutil.which(name) is not None
+
+
+def graphical_terminal_available() -> bool:
+    return any(
+        command_exists(name)
+        for name in ("gnome-terminal", "mate-terminal", "konsole", "xfce4-terminal", "x-terminal-emulator")
+    )
