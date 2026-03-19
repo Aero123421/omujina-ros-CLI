@@ -18,6 +18,7 @@ class WorkspaceTest(unittest.TestCase):
         self.assertIn("curl -fL -o /tmp/ros2-apt-source.deb", script)
         self.assertIn("dpkg-deb --info /tmp/ros2-apt-source.deb >/dev/null", script)
         self.assertNotIn("api.github.com/repos/ros-infrastructure/ros-apt-source/releases/latest", script)
+        self.assertIn("can-utils", script)
 
     def test_initial_setup_script_can_skip_upgrade(self) -> None:
         script = build_initial_setup_script(skip_upgrade=True)

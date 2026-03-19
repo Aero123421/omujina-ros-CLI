@@ -49,6 +49,14 @@ def current_policy_label(paths: AppPaths, state: RuntimeState) -> str:
     return "カスタムまたは未同期"
 
 
+def sim_policy_verified(state: RuntimeState) -> bool:
+    return bool(
+        state.last_sim_success
+        and state.active_policy_hash
+        and state.last_sim_policy_hash == state.active_policy_hash
+    )
+
+
 def detect_real_devices() -> dict[str, bool]:
     return {
         "/dev/rt_usb_imu": Path("/dev/rt_usb_imu").exists(),
@@ -56,6 +64,26 @@ def detect_real_devices() -> dict[str, bool]:
         "can0": Path("/sys/class/net/can0").exists(),
         "/dev/input/js0": Path("/dev/input/js0").exists(),
     }
+
+
+def list_serial_device_candidates(limit: int = 8) -> list[str]:
+    candidates: list[str] = []
+    for pattern in ("ttyUSB*", "ttyACM*"):
+        for path in sorted(Path("/dev").glob(pattern)):
+            candidates.append(str(path))
+    serial_by_id_dir = Path("/dev/serial/by-id")
+    if serial_by_id_dir.exists():
+        for path in sorted(serial_by_id_dir.iterdir()):
+            candidates.append(str(path))
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        deduped.append(candidate)
+    return deduped[:limit]
 
 
 def real_setup_status() -> dict[str, bool]:
@@ -114,7 +142,9 @@ def build_doctor_report(paths: AppPaths, state: RuntimeState) -> DoctorReport:
     workspace_built = workspace_build_ready(paths)
     usb_policy_count = count_usb_policies()
     active_policy = current_policy_label(paths, state)
+    sim_ready = sim_policy_verified(state)
     devices = detect_real_devices()
+    serial_candidates = list_serial_device_candidates()
     real_setup = real_setup_status()
     tool_status = {
         "git": command_exists("git"),
@@ -123,6 +153,7 @@ def build_doctor_report(paths: AppPaths, state: RuntimeState) -> DoctorReport:
         "tmux": command_exists("tmux"),
         "colcon": command_exists("colcon"),
         "rosdep": command_exists("rosdep"),
+        "slcand": command_exists("slcand"),
     }
     notes: list[str] = []
 
@@ -141,6 +172,8 @@ def build_doctor_report(paths: AppPaths, state: RuntimeState) -> DoctorReport:
         notes.append("install/setup.bash が無いため ROS パッケージはまだ見えません。")
     elif usb_policy_count > 0:
         recommendation = "USB 上の ONNX を切り替え可能です。"
+    elif sim_ready:
+        recommendation = "今の policy は SIM 確認済みです。実機前診断へ進めます。"
     elif devices["/dev/rt_usb_imu"] and devices["/dev/input/js0"] and (devices["can0"] or devices["/dev/usb_can"]):
         recommendation = "実機起動前チェックは良好です。"
     else:
@@ -149,7 +182,9 @@ def build_doctor_report(paths: AppPaths, state: RuntimeState) -> DoctorReport:
         notes.append("GUI ターミナルも tmux も無いため、別ウィンドウ起動ができません。どちらかを導入してください。")
     elif workspace_built and not tool_status["terminal"] and tool_status["tmux"]:
         notes.append("GUI ターミナルが無い環境では tmux をフォールバックに使います。")
-    if state.last_action == "policy_switch" and not state.last_sim_success:
+    if sim_ready:
+        notes.append("現在の active policy は SIM 確認済みとして記録されています。")
+    if state.last_action == "policy_switch" and not sim_ready:
         notes.append("policy を切り替えた直後です。まずは SIM と ONNX テストで確認してください。")
     if state.real_setup_requires_relogin and real_setup["udev_rule"] and not real_setup["dialout"]:
         notes.append("実機用設定は入りましたが、dialout を反映するには一度ログアウトして再ログインしてください。")
@@ -157,6 +192,13 @@ def build_doctor_report(paths: AppPaths, state: RuntimeState) -> DoctorReport:
         notes.append("実機を使う場合は dialout 追加と 90-mujina.rules の配置が必要です。")
     if real_setup["dialout"] and not real_setup["udev_rule"]:
         notes.append("/etc/udev/rules.d/90-mujina.rules がまだ入っていません。")
+    if serial_candidates and (not devices["/dev/usb_can"] or not devices["/dev/rt_usb_imu"]):
+        notes.append(
+            "汎用 USB シリアル候補は見えていますが、期待する固定名デバイスが不足しています。"
+            " 候補が IMU / USB-CAN のどちらかはこの CLI だけでは断定できません。"
+        )
+    if devices["/dev/usb_can"] and not tool_status["slcand"]:
+        notes.append("serial CAN を使う構成では `slcand` が必要です。見つからない場合は `can-utils` を導入してください。")
 
     return DoctorReport(
         os_label=os_label,
@@ -166,7 +208,9 @@ def build_doctor_report(paths: AppPaths, state: RuntimeState) -> DoctorReport:
         workspace_built=workspace_built,
         active_policy_label=active_policy,
         usb_policy_count=usb_policy_count,
+        sim_ready=sim_ready,
         real_devices=devices,
+        serial_candidates=serial_candidates,
         tool_status=tool_status,
         notes=notes,
         recommendation=recommendation,

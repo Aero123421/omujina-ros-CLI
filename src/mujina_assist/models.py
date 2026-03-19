@@ -116,7 +116,9 @@ class DoctorReport:
     workspace_built: bool
     active_policy_label: str
     usb_policy_count: int
+    sim_ready: bool = False
     real_devices: dict[str, bool] = field(default_factory=dict)
+    serial_candidates: list[str] = field(default_factory=list)
     tool_status: dict[str, bool] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
     recommendation: str = ""

@@ -43,7 +43,7 @@ def build_initial_setup_script(skip_upgrade: bool = False) -> str:
         "set -e",
         "export DEBIAN_FRONTEND=noninteractive",
         "sudo apt update",
-        "sudo apt install -y software-properties-common curl git python3-pip python3-venv lsb-release tmux",
+        "sudo apt install -y software-properties-common curl git python3-pip python3-venv lsb-release tmux can-utils",
         "sudo add-apt-repository -y universe",
         "sudo apt update && sudo apt install -y curl",
         "ROS_APT_SOURCE_REDIRECT=$(curl -fsSLI https://github.com/ros-infrastructure/ros-apt-source/releases/latest | awk 'BEGIN { IGNORECASE = 1 } /^location:/ { print $2 }' | tail -n 1 | tr -d '\\r')",

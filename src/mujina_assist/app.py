@@ -9,6 +9,8 @@ from mujina_assist.models import AppPaths, JobRecord, PolicyCandidate
 from mujina_assist.services.checks import (
     build_doctor_report,
     detect_real_devices,
+    list_serial_device_candidates,
+    sim_policy_verified,
     workspace_build_ready,
     workspace_clone_ready,
     write_config_file,
@@ -70,6 +72,7 @@ class MujinaAssistApp:
         bullet(f"workspace: {'OK' if report.workspace_cloned else '未作成'}")
         bullet(f"build: {'OK' if report.workspace_built else '未実行'}")
         bullet(f"active policy: {report.active_policy_label}")
+        bullet(f"SIM確認済み: {'OK' if report.sim_ready else '未確認'}")
         bullet(f"USB上のONNX: {report.usb_policy_count} 件")
         real_devices = ", ".join(
             [f"{name}={'OK' if ok else 'NG'}" for name, ok in report.real_devices.items()]
@@ -77,6 +80,8 @@ class MujinaAssistApp:
         bullet(f"実機デバイス: {real_devices}")
         tools = ", ".join([f"{name}={'OK' if ok else 'NG'}" for name, ok in report.tool_status.items()])
         bullet(f"主要ツール: {tools}")
+        if report.serial_candidates:
+            bullet("USBシリアル候補: " + ", ".join(report.serial_candidates[:4]))
 
         running_jobs = active_jobs(self.paths)
         if running_jobs:
@@ -104,9 +109,11 @@ class MujinaAssistApp:
             options = [
                 "初回セットアップ",
                 "状態確認",
+                "実機前診断",
                 "build する",
                 "可視化する",
                 "SIM を起動する",
+                "SIM 確認を記録する",
                 "実機を起動する",
                 "ポリシーを切り替える",
                 "ONNX 読み込みテスト",
@@ -122,30 +129,87 @@ class MujinaAssistApp:
             elif selection == 1:
                 self.handle_doctor()
             elif selection == 2:
-                self.handle_build()
+                self.handle_preflight()
             elif selection == 3:
-                self.handle_viz()
+                self.handle_build()
             elif selection == 4:
-                self.handle_sim()
+                self.handle_viz()
             elif selection == 5:
-                self.handle_real_robot()
+                self.handle_sim()
             elif selection == 6:
-                self.handle_policy_menu()
+                self.handle_mark_sim_verified()
             elif selection == 7:
-                self.handle_policy_test()
+                self.handle_real_robot()
             elif selection == 8:
-                self.handle_motor_read()
+                self.handle_policy_menu()
             elif selection == 9:
-                self.handle_zero_position()
+                self.handle_policy_test()
             elif selection == 10:
-                self.handle_logs()
+                self.handle_motor_read()
             elif selection == 11:
+                self.handle_zero_position()
+            elif selection == 12:
+                self.handle_logs()
+            elif selection == 13:
                 return 0
             pause()
 
     def handle_doctor(self) -> int:
         self.print_status()
         return 0
+
+    def handle_preflight(self, can_mode: str = "auto") -> int:
+        title("実機前診断")
+        if not self._require_built_workspace():
+            return 1
+        self._sync_default_policy_state()
+        report = build_doctor_report(self.paths, self.state)
+        selected_can_mode = self._diagnostic_can_mode(can_mode)
+        missing = self._missing_devices_for_can_mode(selected_can_mode, include_imu=True, include_joy=True)
+
+        section("診断結果")
+        bullet(f"active policy: {report.active_policy_label}")
+        bullet(f"SIM確認済み: {'OK' if report.sim_ready else '未確認'}")
+        bullet(f"想定 CAN モード: {selected_can_mode}")
+        if selected_can_mode == "serial":
+            bullet(f"slcand: {'OK' if report.tool_status.get('slcand', False) else 'NG'}")
+        for name in ("/dev/rt_usb_imu", "/dev/input/js0", "can0" if selected_can_mode == "net" else "/dev/usb_can"):
+            ok = report.real_devices.get(name, False)
+            bullet(f"{name}: {'OK' if ok else 'NG'}")
+
+        if report.serial_candidates:
+            section("検出したUSBシリアル候補")
+            for candidate in report.serial_candidates:
+                bullet(candidate)
+
+        if missing:
+            self._report_missing_devices(
+                "実機前診断で不足デバイスが見つかりました。",
+                missing,
+                can_mode=selected_can_mode,
+                include_imu=True,
+                include_joy=True,
+            )
+        else:
+            success("必須デバイスの存在確認は通っています。")
+
+        if selected_can_mode == "serial" and not report.tool_status.get("slcand", False):
+            warn("serial CAN を使うには `slcand` が必要です。`can-utils` の導入を確認してください。")
+
+        section("次のおすすめ")
+        if not report.sim_ready:
+            bullet("今の active policy で SIM の姿勢と入力応答を確認してください。")
+            bullet("確認後に `SIM 確認を記録する` を実行すると、実機前ゲートが通りやすくなります。")
+        else:
+            bullet("今の active policy は SIM 確認済みとして記録されています。")
+        bullet("必要なら `ONNX 読み込みテスト` を先に実行してください。")
+        if not report.sim_ready and ask_yes_no("今の active policy で SIM 確認済みなら、ここで記録しますか？", default=False):
+            return self._mark_current_policy_sim_verified(ask_confirmation=False)
+        return 0
+
+    def handle_mark_sim_verified(self) -> int:
+        title("SIM確認を記録")
+        return self._mark_current_policy_sim_verified(ask_confirmation=True)
 
     def handle_setup(self, skip_upgrade: bool = False) -> int:
         title("初回セットアップ")
@@ -222,6 +286,7 @@ class MujinaAssistApp:
         result = self._launch_job_group(jobs, heading="SIM ジョブを起動しました。")
         if result == 0:
             warn("実機へ進む前に、起動した別ターミナル側で姿勢と入力応答を実際に確認してください。")
+            bullet("確認できたら、メニューの `SIM 確認を記録する` か `実機前診断` から記録してください。")
             self.state.last_action = "sim_launch"
             self.state.last_sim_success = False
             self.state.last_sim_policy_hash = ""
@@ -234,8 +299,15 @@ class MujinaAssistApp:
             return 1
         if not self._confirm_no_conflicting_jobs({"real_imu", "real_main", "real_joy"}):
             return 1
+        self._sync_default_policy_state()
         selected_can_mode = self._select_can_mode(can_mode)
         if selected_can_mode is None:
+            return 1
+        report = build_doctor_report(self.paths, self.state)
+        if selected_can_mode == "serial" and not report.tool_status.get("slcand", False):
+            error("serial CAN 用の `slcand` が見つかりません。")
+            bullet("Ubuntu 24.04 では通常 `can-utils` の導入で入ります。")
+            bullet("必要なら `sudo apt install -y can-utils` を実行してから再試行してください。")
             return 1
         missing = self._missing_devices_for_can_mode(selected_can_mode, include_imu=True, include_joy=True)
         if missing:
@@ -247,7 +319,7 @@ class MujinaAssistApp:
                 include_joy=True,
             )
             return 1
-        if not self.state.last_sim_success or self.state.last_sim_policy_hash != self.state.active_policy_hash:
+        if not sim_policy_verified(self.state):
             warn("今の policy で SIM 起動済みの記録がありません。")
             bullet("実機へ進む前に、少なくとも一度は同じ policy で SIM を起動して挙動確認するのがおすすめです。")
             if not ask_yes_no("それでも実機起動ジョブを起動しますか？", default=False):
@@ -407,6 +479,17 @@ class MujinaAssistApp:
         title("ジョブとログ")
         jobs = recent_jobs(self.paths, limit=10)
         if jobs:
+            grouped_jobs: dict[str, list[JobRecord]] = {}
+            for job in jobs:
+                if job.group_id:
+                    grouped_jobs.setdefault(job.group_id, []).append(job)
+            if grouped_jobs:
+                section("最近のジョブグループ")
+                for _group_id, items in list(grouped_jobs.items())[:3]:
+                    items = sorted(items, key=lambda item: item.created_at)
+                    label = items[0].group_id.split("-", 1)[0].upper()
+                    summary = ", ".join(f"{item.name}={item.status}" for item in items)
+                    bullet(f"{label}: {summary}")
             section("最近のジョブ")
             for job in jobs:
                 bullet(f"{summarize_job(job)} | ログ: {Path(job.log_path).name}")
@@ -865,6 +948,7 @@ class MujinaAssistApp:
 
     def _select_can_mode(self, preferred: str) -> str | None:
         devices = detect_real_devices()
+        serial_candidates = list_serial_device_candidates()
         net_available = devices.get("can0", False)
         serial_available = devices.get("/dev/usb_can", False)
         if preferred == "net" and net_available:
@@ -873,6 +957,10 @@ class MujinaAssistApp:
             return "serial"
         if preferred in {"net", "serial"}:
             warn(f"指定された CAN モード {preferred} は今の接続状態では使えません。")
+            if preferred == "serial" and serial_candidates:
+                bullet("汎用 USB シリアル機器は見えていますが、想定名 `/dev/usb_can` がありません。")
+                for candidate in serial_candidates[:4]:
+                    bullet(candidate)
         options: list[tuple[str, str]] = []
         if net_available:
             options.append(("net", "network CAN: can0 を使います"))
@@ -880,6 +968,10 @@ class MujinaAssistApp:
             options.append(("serial", "serial CAN: /dev/usb_can を使います"))
         if not options:
             error("利用可能な CAN デバイスが見つかりません。")
+            if serial_candidates:
+                bullet("汎用 USB シリアル候補は見えています。udev ルールで `/dev/usb_can` に固定されているか確認してください。")
+                for candidate in serial_candidates[:4]:
+                    bullet(candidate)
             return None
         if len(options) == 1:
             return options[0][0]
@@ -912,19 +1004,80 @@ class MujinaAssistApp:
         include_joy: bool,
     ) -> None:
         error(summary)
+        serial_candidates = list_serial_device_candidates()
         for item in missing:
             bullet(item)
         section("次にやること")
         if include_imu and "/dev/rt_usb_imu" in missing:
             bullet("IMU を挿し直し、必要なら一度ログアウトして再ログインしてください。")
+            if serial_candidates:
+                bullet("他の USB シリアル候補は見えていますが、IMU か別機器かはこの CLI だけでは断定できません。")
         if can_mode == "net" and "can0" in missing:
             bullet("network CAN を使うなら、CAN セットアップ後に `can0` が見える状態で再実行してください。")
             bullet("USB-CAN が serial 型なら、実行前に CAN モードを `serial` に切り替えてください。")
         if can_mode == "serial" and "/dev/usb_can" in missing:
             bullet("serial CAN アダプタを挿し直し、必要なら `dialout` と udev 設定後に再ログインしてください。")
             bullet("すでに `can0` がある構成なら、CAN モードを `net` に切り替えてください。")
+            if serial_candidates:
+                bullet("他の USB シリアル候補は見えていますが、USB-CAN か別機器かはこの CLI だけでは断定できません。")
+                for candidate in serial_candidates[:4]:
+                    bullet(candidate)
+                bullet("機器の VID/PID が `90-mujina.rules` と一致しているか確認してください。")
         if include_joy and "/dev/input/js0" in missing:
             bullet("ゲームパッドをつなぎ直し、OS から認識されていることを確認してください。")
+
+    def _diagnostic_can_mode(self, preferred: str) -> str:
+        devices = detect_real_devices()
+        if preferred in {"net", "serial"}:
+            return preferred
+        net_available = devices.get("can0", False)
+        serial_available = devices.get("/dev/usb_can", False)
+        if net_available and serial_available:
+            selected = select_from_list(
+                "診断したい CAN モードを選んでください。",
+                [
+                    "network CAN を前提に診断する",
+                    "serial CAN を前提に診断する",
+                ],
+            )
+            return "net" if selected == 0 else "serial"
+        if net_available:
+            return "net"
+        if serial_available:
+            return "serial"
+        serial_candidates = list_serial_device_candidates()
+        if serial_candidates:
+            warn("`can0` も `/dev/usb_can` も見えていません。")
+            bullet("汎用 USB シリアル候補はありますが、IMU / USB-CAN のどちらかはこの CLI だけでは断定できません。")
+            for candidate in serial_candidates[:4]:
+                bullet(candidate)
+            selected = select_from_list(
+                "確認したい CAN モードを選んでください。",
+                [
+                    "network CAN を前提に診断する",
+                    "serial CAN を前提に診断する",
+                ],
+            )
+            return "net" if selected == 0 else "serial"
+        return "net"
+
+    def _mark_current_policy_sim_verified(self, *, ask_confirmation: bool) -> int:
+        if not self._require_built_workspace():
+            return 1
+        self._sync_default_policy_state()
+        if not self.state.active_policy_hash:
+            error("active policy の hash を取得できませんでした。先に build か policy 切替を確認してください。")
+            return 1
+        bullet("現在の active policy で、SIM の姿勢と入力応答を人が確認できたあとに使ってください。")
+        if ask_confirmation and not ask_yes_no("今の active policy で SIM の確認を完了しましたか？", default=False):
+            warn("SIM 確認記録を中止しました。")
+            return 1
+        self.state.last_action = "sim_verified"
+        self.state.last_sim_success = True
+        self.state.last_sim_policy_hash = self.state.active_policy_hash
+        self.save_state()
+        success("今の active policy を SIM 確認済みとして記録しました。")
+        return 0
 
     def _ask_ids(self) -> list[int]:
         raw = ask_text("対象の motor ID を空白またはカンマ区切りで入力してください。例: 1 2 3 / 1,2,3")
@@ -947,13 +1100,16 @@ class MujinaAssistApp:
     def _sync_default_policy_state(self) -> None:
         if not self.paths.source_policy_path.exists():
             return
-        if self.paths.default_policy_cache.exists():
-            self.state.active_policy_label = "公式デフォルト"
-            self.state.active_policy_source = str(self.paths.default_policy_cache)
         try:
             from mujina_assist.services.checks import file_hash
 
-            self.state.active_policy_hash = file_hash(self.paths.source_policy_path)
+            current_hash = file_hash(self.paths.source_policy_path)
+            self.state.active_policy_hash = current_hash
+            if self.paths.default_policy_cache.exists():
+                default_hash = file_hash(self.paths.default_policy_cache)
+                if current_hash == default_hash:
+                    self.state.active_policy_label = "公式デフォルト"
+                    self.state.active_policy_source = str(self.paths.default_policy_cache)
         except Exception:
             self.state.active_policy_hash = ""
 
@@ -1018,9 +1174,12 @@ def build_parser() -> argparse.ArgumentParser:
     setup_parser.add_argument("--skip-upgrade", action="store_true")
 
     subparsers.add_parser("doctor")
+    preflight_parser = subparsers.add_parser("preflight")
+    preflight_parser.add_argument("--can-mode", choices=["auto", "net", "serial"], default="auto")
     subparsers.add_parser("build")
     subparsers.add_parser("viz")
     subparsers.add_parser("sim")
+    subparsers.add_parser("sim-verified")
     subparsers.add_parser("logs")
 
     robot_parser = subparsers.add_parser("robot")
@@ -1055,12 +1214,16 @@ def run_app(repo_root: Path, argv: list[str] | None = None) -> int:
         return app.handle_setup(skip_upgrade=args.skip_upgrade)
     if command == "doctor":
         return app.handle_doctor()
+    if command == "preflight":
+        return app.handle_preflight(can_mode=args.can_mode)
     if command == "build":
         return app.handle_build()
     if command == "viz":
         return app.handle_viz()
     if command == "sim":
         return app.handle_sim()
+    if command == "sim-verified":
+        return app.handle_mark_sim_verified()
     if command == "logs":
         return app.handle_logs()
     if command == "robot":
