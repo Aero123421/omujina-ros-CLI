@@ -307,7 +307,7 @@ class MujinaAssistApp:
         title("実機起動")
         if not self._require_built_workspace():
             return 1
-        if not self._confirm_no_conflicting_jobs({"real_imu", "real_main", "real_joy"}):
+        if not self._confirm_no_conflicting_jobs({"motor_read", "zero", "real_imu", "real_main", "real_joy"}):
             return 1
         self._sync_default_policy_state()
         selected_can_mode = self._select_can_mode(can_mode)

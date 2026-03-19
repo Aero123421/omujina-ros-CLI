@@ -324,6 +324,17 @@ class AppTest(unittest.TestCase):
 
             self.assertEqual(result, 1)
 
+    def test_handle_real_robot_blocks_when_motor_read_is_running(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = MujinaAssistApp(Path(tmp))
+            self._prepare_built_workspace(app)
+
+            with patch.object(app, "_confirm_no_conflicting_jobs", return_value=False) as confirm_mock:
+                result = app.handle_real_robot()
+
+            self.assertEqual(result, 1)
+            confirm_mock.assert_called_once_with({"motor_read", "zero", "real_imu", "real_main", "real_joy"})
+
     def test_handle_real_robot_uses_generic_imu_fallback_port(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             app = MujinaAssistApp(Path(tmp))
