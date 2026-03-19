@@ -48,7 +48,14 @@ def run_bash(
         piped = script
         if log_path:
             quoted = shlex.quote(str(log_path))
-            piped = f"set -o pipefail; ({script}) 2>&1 | tee -a {quoted}"
+            piped = "\n".join(
+                [
+                    "set -o pipefail",
+                    "(",
+                    script,
+                    f") 2>&1 | tee -a {quoted}",
+                ]
+            )
         completed = subprocess.run(
             ["bash", "-lc", piped],
             cwd=str(cwd) if cwd else None,
