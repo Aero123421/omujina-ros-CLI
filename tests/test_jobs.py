@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from mujina_assist.models import AppPaths
-from mujina_assist.services.jobs import create_job, list_jobs, mark_job_running, mark_job_stopped, summarize_job
+from mujina_assist.services.jobs import create_job, list_jobs, load_job, mark_job_running, mark_job_stopped, summarize_job, update_job
 
 
 class JobsTest(unittest.TestCase):
@@ -42,6 +42,25 @@ class JobsTest(unittest.TestCase):
 
             self.assertEqual(job.terminal_mode, "terminal")
             self.assertEqual(job.terminal_label, "gnome-terminal")
+
+    def test_update_job_merges_with_latest_saved_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths.from_repo_root(Path(tmp))
+            paths.ensure_directories()
+
+            job = create_job(paths, kind="build", name="workspace build")
+            running = update_job(job, status="running", message="worker is running")
+
+            stale = load_job(Path(running.job_file))
+            stale.status = "queued"
+
+            update_job(stale, terminal_mode="terminal", terminal_label="gnome-terminal")
+            merged = list_jobs(paths)[0]
+
+            self.assertEqual(merged.status, "running")
+            self.assertEqual(merged.message, "worker is running")
+            self.assertEqual(merged.terminal_mode, "terminal")
+            self.assertEqual(merged.terminal_label, "gnome-terminal")
 
 
 if __name__ == "__main__":

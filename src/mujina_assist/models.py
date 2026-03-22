@@ -5,6 +5,9 @@ from pathlib import Path
 from typing import Any
 
 
+DEFAULT_MOTOR_IDS = [10, 11, 12, 7, 8, 9, 4, 5, 6, 1, 2, 3]
+
+
 @dataclass(slots=True)
 class AppPaths:
     repo_root: Path
@@ -20,6 +23,8 @@ class AppPaths:
     runtime_state_file: Path
     config_file: Path
     default_policy_cache: Path
+    policy_index_file: Path
+    policy_history_file: Path
 
     @classmethod
     def from_repo_root(cls, repo_root: Path) -> "AppPaths":
@@ -46,6 +51,8 @@ class AppPaths:
             runtime_state_file=state_dir / "runtime.json",
             config_file=state_dir / "config.json",
             default_policy_cache=cache_dir / "default_policy.onnx",
+            policy_index_file=cache_dir / "policy_index.json",
+            policy_history_file=state_dir / "policy_history.jsonl",
         )
 
     def ensure_directories(self) -> None:
@@ -68,12 +75,15 @@ class AppPaths:
 
 @dataclass(slots=True)
 class RuntimeState:
-    active_policy_label: str = "公式デフォルト"
+    active_policy_label: str = "未設定"
     active_policy_source: str = ""
     active_policy_hash: str = ""
     last_action: str = ""
     last_sim_success: bool = False
     last_sim_policy_hash: str = ""
+    last_sim_verified_at: str = ""
+    last_sim_verified_label: str = ""
+    last_sim_verified_source: str = ""
     real_setup_requires_relogin: bool = False
     tmux_session_name: str = ""
 
@@ -96,6 +106,7 @@ class JobRecord:
     returncode: int | None = None
     message: str = ""
     terminal_label: str = ""
+    terminal_pid: int | None = None
 
 
 @dataclass(slots=True)
@@ -105,6 +116,22 @@ class PolicyCandidate:
     source_type: str
     description: str = ""
     manifest_path: Path | None = None
+    policy_hash: str = ""
+    size_bytes: int = 0
+    last_used_at: str = ""
+    use_count: int = 0
+    is_active: bool = False
+    sim_verified: bool = False
+
+
+@dataclass(slots=True)
+class DoctorCheck:
+    key: str
+    label: str
+    status: str
+    summary: str
+    details: list[str] = field(default_factory=list)
+    next_steps: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -115,8 +142,11 @@ class DoctorReport:
     workspace_cloned: bool
     workspace_built: bool
     active_policy_label: str
-    usb_policy_count: int
+    active_policy_source: str = ""
+    active_policy_hash: str = ""
+    usb_policy_count: int = 0
     sim_ready: bool = False
+    sim_verified_at: str = ""
     real_devices: dict[str, bool] = field(default_factory=dict)
     serial_candidates: list[str] = field(default_factory=list)
     imu_port_label: str = ""
@@ -124,3 +154,21 @@ class DoctorReport:
     tool_status: dict[str, bool] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
     recommendation: str = ""
+    checks: list[DoctorCheck] = field(default_factory=list)
+    policy_cache_count: int = 0
+    policy_cache_size_bytes: int = 0
+
+
+@dataclass(slots=True)
+class PolicyCacheEntry:
+    policy_hash: str
+    blob_path: str
+    label: str
+    source_kind: str
+    original_path: str
+    size_bytes: int
+    first_seen_at: str
+    last_used_at: str
+    use_count: int = 0
+    pinned: bool = False
+    manifest_path: str = ""

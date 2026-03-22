@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict
+from dataclasses import fields as dataclass_fields
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
@@ -43,13 +44,11 @@ def create_job(
 def save_job(job: JobRecord) -> None:
     path = Path(job.job_file)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(asdict(job), handle, indent=2, ensure_ascii=False)
+    path.write_text(json.dumps(asdict(job), indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def load_job(path: Path) -> JobRecord:
-    with path.open("r", encoding="utf-8") as handle:
-        data = json.load(handle)
+    data = json.loads(path.read_text(encoding="utf-8"))
     return JobRecord(**data)
 
 
@@ -89,22 +88,36 @@ def update_job(
     returncode: int | None = None,
     message: str | None = None,
     terminal_label: str | None = None,
+    terminal_pid: int | None = None,
 ) -> JobRecord:
+    current = job
+    job_path = Path(job.job_file)
+    if job_path.exists():
+        try:
+            current = load_job(job_path)
+        except Exception:
+            current = job
+
     if status is not None:
-        job.status = status
+        current.status = status
     if terminal_mode is not None:
-        job.terminal_mode = terminal_mode
+        current.terminal_mode = terminal_mode
     if started_at is not None:
-        job.started_at = started_at
+        current.started_at = started_at
     if finished_at is not None:
-        job.finished_at = finished_at
+        current.finished_at = finished_at
     if returncode is not None:
-        job.returncode = returncode
+        current.returncode = returncode
     if message is not None:
-        job.message = message
+        current.message = message
     if terminal_label is not None:
-        job.terminal_label = terminal_label
-    save_job(job)
+        current.terminal_label = terminal_label
+    if terminal_pid is not None:
+        current.terminal_pid = terminal_pid
+
+    save_job(current)
+    for field in dataclass_fields(JobRecord):
+        setattr(job, field.name, getattr(current, field.name))
     return job
 
 
@@ -112,9 +125,9 @@ def mark_job_running(job: JobRecord, *, terminal_mode: str | None = None, termin
     return update_job(
         job,
         status="running",
-        terminal_mode=terminal_mode,
+        terminal_mode=terminal_mode if terminal_mode is not None else job.terminal_mode,
+        terminal_label=terminal_label if terminal_label is not None else job.terminal_label,
         started_at=_timestamp(),
-        terminal_label=terminal_label,
     )
 
 
@@ -138,15 +151,14 @@ def _finish_job(job: JobRecord, *, status: str, returncode: int, message: str) -
 
 
 def summarize_job(job: JobRecord) -> str:
-    label = job.name
     if job.status == "queued":
-        return f"{label}: 起動待ち"
+        return f"{job.name}: 起動待ち"
     if job.status == "running":
-        return f"{label}: 実行中"
+        return f"{job.name}: 実行中"
     if job.status == "succeeded":
-        return f"{label}: 完了"
+        return f"{job.name}: 成功"
     if job.status == "failed":
-        return f"{label}: 失敗"
+        return f"{job.name}: 失敗"
     if job.status == "stopped":
-        return f"{label}: 停止"
-    return f"{label}: {job.status}"
+        return f"{job.name}: 停止"
+    return f"{job.name}: {job.status}"

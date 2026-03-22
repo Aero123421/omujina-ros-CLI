@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from mujina_assist.models import AppPaths, PolicyCandidate, RuntimeState
-from mujina_assist.services.policy import activate_policy, import_policy_to_cache
+from mujina_assist.services.policy import activate_policy, cleanup_policy_cache, import_policy_to_cache
 from mujina_assist.services.shell import CommandResult
 
 
@@ -18,12 +18,10 @@ class PolicyTest(unittest.TestCase):
             paths.ensure_directories()
             source = repo_root / "demo.onnx"
             source.write_bytes(b"onnx")
-            candidate = PolicyCandidate(
-                label="USB: demo.onnx",
-                path=source,
-                source_type="usb",
-            )
+            candidate = PolicyCandidate(label="USB: demo.onnx", path=source, source_type="usb")
+
             cached = import_policy_to_cache(paths, candidate)
+
             self.assertTrue(cached.exists())
             self.assertEqual(cached.read_bytes(), b"onnx")
 
@@ -40,11 +38,7 @@ class PolicyTest(unittest.TestCase):
 
             incoming = repo_root / "new.onnx"
             incoming.write_bytes(b"broken")
-            candidate = PolicyCandidate(
-                label="USB: new.onnx",
-                path=incoming,
-                source_type="usb",
-            )
+            candidate = PolicyCandidate(label="USB: new.onnx", path=incoming, source_type="usb")
             state = RuntimeState(
                 active_policy_label="公式デフォルト",
                 active_policy_source=str(paths.default_policy_cache),
@@ -62,6 +56,33 @@ class PolicyTest(unittest.TestCase):
             self.assertFalse(ok)
             self.assertEqual(source_policy.read_bytes(), b"default")
             self.assertEqual(state.active_policy_label, "公式デフォルト")
+
+    def test_cleanup_policy_cache_preserves_active_and_sim_verified_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            paths = AppPaths.from_repo_root(repo_root)
+            paths.ensure_directories()
+
+            protected = paths.imported_policy_dir / "protected.onnx"
+            protected.write_bytes(b"a")
+            old = paths.imported_policy_dir / "old.onnx"
+            old.write_bytes(b"b")
+            paths.policy_index_file.write_text(
+                '{"entries": ['
+                '{"policy_hash": "active", "blob_path": "%s", "label": "active", "source_kind": "usb", "original_path": "", "size_bytes": 1, "first_seen_at": "2026-01-01T00:00:00+09:00", "last_used_at": "2026-01-02T00:00:00+09:00", "use_count": 1, "pinned": false, "manifest_path": ""},'
+                '{"policy_hash": "old", "blob_path": "%s", "label": "old", "source_kind": "usb", "original_path": "", "size_bytes": 1, "first_seen_at": "2026-01-01T00:00:00+09:00", "last_used_at": "2026-01-01T00:00:00+09:00", "use_count": 1, "pinned": false, "manifest_path": ""}'
+                "]}"
+                % (str(protected).replace("\\", "\\\\"), str(old).replace("\\", "\\\\")),
+                encoding="utf-8",
+            )
+            state = RuntimeState(active_policy_hash="active", active_policy_source=str(protected), last_sim_policy_hash="active")
+
+            with patch("mujina_assist.services.policy.MAX_CACHED_POLICIES", 1):
+                result = cleanup_policy_cache(paths, state, dry_run=False)
+
+            self.assertEqual(result["deleted_entries"], 1)
+            self.assertTrue(protected.exists())
+            self.assertFalse(old.exists())
 
 
 if __name__ == "__main__":

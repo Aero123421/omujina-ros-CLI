@@ -53,25 +53,46 @@ def ask_yes_no(prompt: str, default: bool = False) -> bool:
             return True
         if answer in {"n", "no", "いいえ", "iie"}:
             return False
-        warn("y / n または はい / いいえ で答えてください。")
+        warn("`y` / `n`、または `はい` / `いいえ` で答えてください。")
 
 
 def ask_text(prompt: str) -> str:
     return input(f"{prompt}\n> ").strip()
 
 
-def select_from_list(prompt: str, options: Sequence[str]) -> int:
+def select_from_list(
+    prompt: str,
+    options: Sequence[str],
+    *,
+    allow_back: bool = False,
+    allow_cancel: bool = False,
+) -> int | None:
     info(prompt)
+    if allow_back:
+        print("0. 戻る")
     for index, option in enumerate(options, start=1):
         print(f"{index}. {option}")
+    if allow_cancel:
+        print("q. 中止")
     while True:
-        answer = input("> ").strip()
+        answer = input("> ").strip().lower()
+        if allow_back and answer in {"0", "b", "back"}:
+            return None
+        if allow_cancel and answer in {"q", "quit", "cancel"}:
+            return None
         if answer.isdigit():
             selected = int(answer)
             if 1 <= selected <= len(options):
                 return selected - 1
-        warn("番号で選んでください。")
+        if allow_back and allow_cancel:
+            warn("番号で選んでください。戻るなら `0`、中止なら `q` です。")
+        elif allow_back:
+            warn("番号で選んでください。戻るなら `0` です。")
+        elif allow_cancel:
+            warn("番号で選んでください。中止なら `q` です。")
+        else:
+            warn("番号で選んでください。")
 
 
-def pause() -> None:
-    input("\nEnter を押すとメニューに戻ります。")
+def pause(message: str = "Enter を押すとメニューに戻ります。") -> None:
+    input(f"\n{message}")

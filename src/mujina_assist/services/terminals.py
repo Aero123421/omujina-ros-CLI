@@ -18,6 +18,7 @@ class TerminalLaunch:
     mode: str
     label: str
     message: str
+    pid: int | None = None
 
 
 def has_graphical_session() -> bool:
@@ -34,16 +35,13 @@ def terminal_backends() -> list[str]:
 
 def write_worker_script(paths: AppPaths, job: JobRecord) -> Path:
     script_path = job_script_path(job)
-    job_file = Path(job.job_file)
-    log_path = Path(job.log_path)
-    job_name = shlex.quote(job.name)
     content = f"""#!/usr/bin/env bash
 set -uo pipefail
 
 ROOT_DIR={shlex.quote(str(paths.repo_root))}
-JOB_FILE={shlex.quote(str(job_file))}
-LOG_FILE={shlex.quote(str(log_path))}
-JOB_NAME={job_name}
+JOB_FILE={shlex.quote(str(job.job_file))}
+LOG_FILE={shlex.quote(str(job.log_path))}
+JOB_NAME={shlex.quote(job.name)}
 
 cd "$ROOT_DIR"
 printf '%s\\n' "[Mujina Assist] $JOB_NAME を開始します。"
@@ -57,7 +55,7 @@ printf '\\n'
 if [[ "$EXIT_CODE" -eq 0 ]]; then
   printf '%s\\n' "[Mujina Assist] $JOB_NAME は完了しました。"
 else
-  printf '%s\\n' "[Mujina Assist] $JOB_NAME は失敗しました。"
+  printf '%s\\n' "[Mujina Assist] $JOB_NAME は終了コード $EXIT_CODE で停止しました。"
 fi
 printf '%s\\n' "ログ: $LOG_FILE"
 printf '%s\\n' "このターミナルは確認用に開いたままです。"
@@ -73,12 +71,14 @@ def launch_job(paths: AppPaths, job: JobRecord) -> TerminalLaunch:
     script_path = write_worker_script(paths, job)
     if has_graphical_session():
         for backend in terminal_backends():
-            if _launch_in_graphical_terminal(backend, script_path, job.name, paths.repo_root):
+            launched = _launch_in_graphical_terminal(backend, script_path, job.name, paths.repo_root)
+            if launched is not None:
                 return TerminalLaunch(
                     ok=True,
                     mode="terminal",
                     label=backend,
                     message=f"{backend} で {job.name} を起動しました。",
+                    pid=launched.pid,
                 )
     if command_exists("tmux"):
         session_name = _tmux_session_name(job)
@@ -87,25 +87,24 @@ def launch_job(paths: AppPaths, job: JobRecord) -> TerminalLaunch:
                 ok=True,
                 mode="tmux",
                 label=session_name,
-                message=f"GUI ターミナルが無いため tmux セッション {session_name} で {job.name} を起動しました。",
+                message=f"tmux セッション {session_name} で {job.name} を起動しました。",
             )
     return TerminalLaunch(
         ok=False,
         mode="",
         label="",
-        message="利用可能な GUI ターミナルも tmux も見つかりませんでした。",
+        message="使える GUI ターミナルも tmux も見つかりませんでした。",
     )
 
 
-def _launch_in_graphical_terminal(backend: str, script_path: Path, title: str, cwd: Path) -> bool:
+def _launch_in_graphical_terminal(backend: str, script_path: Path, title: str, cwd: Path) -> subprocess.Popen[str] | None:
     command = _backend_command(backend, script_path, title)
     if not command:
-        return False
+        return None
     try:
-        subprocess.Popen(command, cwd=str(cwd))
+        return subprocess.Popen(command, cwd=str(cwd), text=True)
     except Exception:
-        return False
-    return True
+        return None
 
 
 def _backend_command(backend: str, script_path: Path, title: str) -> list[str]:
@@ -115,7 +114,7 @@ def _backend_command(backend: str, script_path: Path, title: str) -> list[str]:
     if backend == "mate-terminal":
         return [backend, "--title", title, "--", "bash", script]
     if backend == "konsole":
-        return [backend, "--hold", "-p", f'tabtitle={title}', "-e", "bash", script]
+        return [backend, "--hold", "-p", f"tabtitle={title}", "-e", "bash", script]
     if backend == "xfce4-terminal":
         return [backend, "--title", title, "--command", f"bash {shlex.quote(script)}"]
     if backend == "x-terminal-emulator":
@@ -129,23 +128,9 @@ def _tmux_session_name(job: JobRecord) -> str:
 
 
 def _launch_in_tmux(session_name: str, script_path: Path, cwd: Path) -> bool:
-    command = [
-        "tmux",
-        "new-session",
-        "-d",
-        "-s",
-        session_name,
-        "bash",
-        str(script_path),
-    ]
+    command = ["tmux", "new-session", "-d", "-s", session_name, "bash", str(script_path)]
     try:
-        completed = subprocess.run(
-            command,
-            cwd=str(cwd),
-            text=True,
-            capture_output=True,
-            check=False,
-        )
+        completed = subprocess.run(command, cwd=str(cwd), text=True, capture_output=True, check=False)
     except Exception:
         return False
     return completed.returncode == 0

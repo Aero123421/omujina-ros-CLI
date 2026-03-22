@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from mujina_assist.models import AppPaths
@@ -40,6 +41,25 @@ class TerminalsTest(unittest.TestCase):
 
             self.assertTrue(result.ok)
             self.assertEqual(result.mode, "tmux")
+
+    def test_launch_job_returns_terminal_pid_for_graphical_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths.from_repo_root(Path(tmp))
+            paths.ensure_directories()
+            job = create_job(paths, kind="build", name="workspace build")
+
+            with patch("mujina_assist.services.terminals.has_graphical_session", return_value=True), patch(
+                "mujina_assist.services.terminals.terminal_backends",
+                return_value=["gnome-terminal"],
+            ), patch(
+                "mujina_assist.services.terminals._launch_in_graphical_terminal",
+                return_value=SimpleNamespace(pid=4321),
+            ):
+                result = launch_job(paths, job)
+
+            self.assertTrue(result.ok)
+            self.assertEqual(result.mode, "terminal")
+            self.assertEqual(result.pid, 4321)
 
 
 if __name__ == "__main__":
