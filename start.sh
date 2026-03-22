@@ -22,8 +22,15 @@ VENV_PYTHON="$VENV_DIR/bin/python"
 RUNNER=(python3)
 
 if [[ -x "$VENV_PYTHON" ]]; then
-  RUNNER=("$VENV_PYTHON")
-else
+  if "$VENV_PYTHON" -m pip --version >>"$BOOTSTRAP_LOG" 2>&1; then
+    RUNNER=("$VENV_PYTHON")
+  else
+    echo "既存の Python 仮想環境が壊れている可能性があるため作り直します。"
+    rm -rf "$VENV_DIR"
+  fi
+fi
+
+if [[ ! -x "$VENV_PYTHON" ]]; then
   echo "起動用の Python 仮想環境を準備します。"
   if python3 -m venv "$VENV_DIR" >>"$BOOTSTRAP_LOG" 2>&1; then
     if ! "$VENV_PYTHON" -m pip install --upgrade pip >>"$BOOTSTRAP_LOG" 2>&1; then

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import signal
 import stat
 import subprocess
 from dataclasses import dataclass
@@ -18,6 +19,7 @@ class TerminalLaunch:
     mode: str
     label: str
     message: str
+    failure_reasons: list[str]
     pid: int | None = None
 
 
@@ -69,42 +71,94 @@ exec bash
 
 def launch_job(paths: AppPaths, job: JobRecord) -> TerminalLaunch:
     script_path = write_worker_script(paths, job)
+    failure_reasons: list[str] = []
     if has_graphical_session():
         for backend in terminal_backends():
-            launched = _launch_in_graphical_terminal(backend, script_path, job.name, paths.repo_root)
+            launched, reason = _launch_in_graphical_terminal(backend, script_path, job.name, paths.repo_root)
+            if reason:
+                failure_reasons.append(f"{backend}: {reason}")
             if launched is not None:
                 return TerminalLaunch(
                     ok=True,
                     mode="terminal",
                     label=backend,
                     message=f"{backend} で {job.name} を起動しました。",
+                    failure_reasons=[],
                     pid=launched.pid,
                 )
     if command_exists("tmux"):
         session_name = _tmux_session_name(job)
-        if _launch_in_tmux(session_name, script_path, paths.repo_root):
+        launched, reason = _launch_in_tmux(session_name, script_path, paths.repo_root)
+        if reason:
+            failure_reasons.append(f"tmux ({session_name}): {reason}")
+        if launched:
             return TerminalLaunch(
                 ok=True,
                 mode="tmux",
                 label=session_name,
                 message=f"tmux セッション {session_name} で {job.name} を起動しました。",
+                failure_reasons=[],
             )
+    else:
+        failure_reasons.append("tmux が見つかりません")
+    if not has_graphical_session():
+        failure_reasons.append("GUIセッションがありません（DISPLAY/WAYLAND_DISPLAY が未設定）")
+    if not terminal_backends():
+        failure_reasons.append("GUIターミナルが見つかりません")
+    if not failure_reasons:
+        failure_reasons.append("GUIターミナル/ tmux で起動できませんでした")
     return TerminalLaunch(
         ok=False,
         mode="",
         label="",
-        message="使える GUI ターミナルも tmux も見つかりませんでした。",
+        message="ジョブを起動できませんでした。失敗原因: " + "; ".join(failure_reasons),
+        failure_reasons=failure_reasons,
     )
 
 
-def _launch_in_graphical_terminal(backend: str, script_path: Path, title: str, cwd: Path) -> subprocess.Popen[str] | None:
+def stop_job_launch(*, mode: str, label: str, pid: int | None = None) -> str | None:
+    if mode == "tmux":
+        if not label:
+            return "tmux セッション名がありません"
+        try:
+            completed = subprocess.run(
+                ["tmux", "kill-session", "-t", label],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        except OSError as exc:
+            return f"{exc.__class__.__name__}: {exc}"
+        if completed.returncode == 0:
+            return None
+        detail = "\n".join(part for part in (completed.stderr.strip(), completed.stdout.strip()) if part)
+        return detail or f"tmux kill-session が終了コード {completed.returncode} を返しました"
+    if mode == "terminal":
+        if pid is None:
+            return "端末 PID がありません"
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError as exc:
+            return f"{exc.__class__.__name__}: {exc}"
+        return "端末プロセスへ SIGTERM は送信しましたが、停止確認はできていません"
+    return f"未知の terminal mode です: {mode}"
+
+
+def _launch_in_graphical_terminal(
+    backend: str,
+    script_path: Path,
+    title: str,
+    cwd: Path,
+) -> tuple[subprocess.Popen[str] | None, str]:
     command = _backend_command(backend, script_path, title)
     if not command:
-        return None
+        return None, f"対応していないバックエンドです: {backend}"
     try:
-        return subprocess.Popen(command, cwd=str(cwd), text=True)
-    except Exception:
-        return None
+        return subprocess.Popen(command, cwd=str(cwd), text=True), ""
+    except OSError as exc:
+        return None, f"{exc.__class__.__name__}: {exc}"
+    except subprocess.SubprocessError as exc:
+        return None, f"{exc.__class__.__name__}: {exc}"
 
 
 def _backend_command(backend: str, script_path: Path, title: str) -> list[str]:
@@ -116,7 +170,7 @@ def _backend_command(backend: str, script_path: Path, title: str) -> list[str]:
     if backend == "konsole":
         return [backend, "--hold", "-p", f"tabtitle={title}", "-e", "bash", script]
     if backend == "xfce4-terminal":
-        return [backend, "--title", title, "--command", f"bash {shlex.quote(script)}"]
+        return [backend, "--title", title, "--command", f"bash -lc {shlex.quote(script)}"]
     if backend == "x-terminal-emulator":
         return [backend, "-e", "bash", script]
     return []
@@ -127,10 +181,16 @@ def _tmux_session_name(job: JobRecord) -> str:
     return f"ma-{suffix}"
 
 
-def _launch_in_tmux(session_name: str, script_path: Path, cwd: Path) -> bool:
+def _launch_in_tmux(session_name: str, script_path: Path, cwd: Path) -> tuple[bool, str]:
     command = ["tmux", "new-session", "-d", "-s", session_name, "bash", str(script_path)]
     try:
         completed = subprocess.run(command, cwd=str(cwd), text=True, capture_output=True, check=False)
-    except Exception:
-        return False
-    return completed.returncode == 0
+    except OSError as exc:
+        return False, f"{exc.__class__.__name__}: {exc}"
+    except subprocess.SubprocessError as exc:
+        return False, f"{exc.__class__.__name__}: {exc}"
+    if completed.returncode == 0:
+        return True, ""
+    detail = "\n".join(part for part in (completed.stderr.strip(), completed.stdout.strip()) if part)
+    reason = detail if detail else f"終了コード {completed.returncode}"
+    return False, reason

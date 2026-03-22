@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import time
 import traceback
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
@@ -11,14 +13,17 @@ from mujina_assist.services.checks import (
     build_doctor_report,
     current_policy_label,
     detect_real_devices,
+    inspect_can_status,
     list_serial_device_candidates,
+    real_setup_status,
     resolve_imu_port,
-    sim_policy_verified,
+    workspace_signature,
     workspace_build_ready,
     workspace_clone_ready,
     write_config_file,
 )
 from mujina_assist.services.jobs import (
+    acquire_job_claim,
     active_jobs,
     create_job,
     job_log_path,
@@ -28,6 +33,7 @@ from mujina_assist.services.jobs import (
     mark_job_running,
     mark_job_stopped,
     recent_jobs,
+    release_job_claim,
     summarize_job,
     update_job,
 )
@@ -49,7 +55,7 @@ from mujina_assist.services.processes import (
 )
 from mujina_assist.services.shell import run_bash
 from mujina_assist.services.state import load_runtime_state, save_runtime_state
-from mujina_assist.services.terminals import launch_job
+from mujina_assist.services.terminals import launch_job, stop_job_launch
 from mujina_assist.services.workspace import (
     capture_default_policy,
     ensure_upstream_clone,
@@ -72,6 +78,9 @@ from mujina_assist.ui import (
     warn,
 )
 
+WORKER_CLAIM_TIMEOUT_SECONDS = 5.0
+WORKER_CLAIM_POLL_SECONDS = 0.1
+
 
 class MujinaAssistApp:
     def __init__(self, repo_root: Path) -> None:
@@ -85,7 +94,31 @@ class MujinaAssistApp:
     def save_state(self) -> None:
         save_runtime_state(self.paths.runtime_state_file, self.state)
 
+    def _clear_manual_recovery_state(self, *, kind: str | None = None) -> None:
+        if kind is not None and self.state.manual_recovery_kind not in {"", kind}:
+            return
+        self.state.manual_recovery_required = False
+        self.state.manual_recovery_kind = ""
+        self.state.manual_recovery_summary = ""
+
+    def _set_manual_recovery_state(self, *, kind: str, summary: str) -> None:
+        self.state.manual_recovery_required = True
+        self.state.manual_recovery_kind = kind
+        self.state.manual_recovery_summary = summary
+
+    def _current_workspace_signature(self) -> str:
+        return workspace_signature(self.paths)
+
+    def _sync_relogin_requirement(self) -> None:
+        if not self.state.real_setup_requires_relogin:
+            return
+        setup_status = real_setup_status()
+        if setup_status.get("dialout") and setup_status.get("udev_rule"):
+            self.state.real_setup_requires_relogin = False
+            self.save_state()
+
     def print_status(self) -> None:
+        self._sync_relogin_requirement()
         report = build_doctor_report(self.paths, self.state)
         title("Mujina Assist")
         section("現在の状態")
@@ -131,6 +164,12 @@ class MujinaAssistApp:
 
         section("おすすめ")
         bullet(report.recommendation or "まずは `保守・診断` から状態確認をしてください。")
+        if self.state.real_setup_requires_relogin:
+            section("要確認")
+            bullet("dialout / udev の設定を反映した直後です。いったんログアウト / ログインしてから実機系を進めてください。")
+        if self.state.manual_recovery_required and self.state.manual_recovery_summary:
+            section("手動復旧が必要")
+            bullet(self.state.manual_recovery_summary)
         if report.notes:
             section("補足")
             for note in report.notes:
@@ -282,11 +321,13 @@ class MujinaAssistApp:
             pause()
 
     def handle_doctor(self) -> int:
+        self._sync_relogin_requirement()
         self.print_status()
         return 0
 
     def handle_preflight(self, can_mode: str = "auto") -> int:
         title("実機前診断")
+        self._sync_relogin_requirement()
         if not self._require_built_workspace():
             return 1
         self._sync_default_policy_state()
@@ -368,13 +409,19 @@ class MujinaAssistApp:
             return 1
         if not self._confirm_no_conflicting_jobs({"sim_main", "sim_joy"}):
             return 1
+        self._sync_default_policy_state()
         if not ask_yes_no("SIM を起動しますか？", default=True):
             warn("SIM 起動を中止しました。")
             return 1
         group_id = f"sim-{uuid4().hex[:8]}"
+        sim_payload = {
+            "policy_hash": self.state.active_policy_hash,
+            "policy_label": self.state.active_policy_label,
+            "workspace_signature": self._current_workspace_signature(),
+        }
         jobs = [
-            create_job(self.paths, kind="sim_main", name="SIM 本体", group_id=group_id),
-            create_job(self.paths, kind="sim_joy", name="SIM joy ノード", group_id=group_id),
+            create_job(self.paths, kind="sim_main", name="SIM 本体", group_id=group_id, payload=dict(sim_payload)),
+            create_job(self.paths, kind="sim_joy", name="SIM joy ノード", group_id=group_id, payload=dict(sim_payload)),
         ]
         result = self._launch_job_group(jobs, heading="SIM を起動しました。")
         if result == 0:
@@ -391,9 +438,17 @@ class MujinaAssistApp:
 
     def handle_real_robot(self, can_mode: str = "auto") -> int:
         title("実機起動")
+        self._sync_relogin_requirement()
         if not self._require_built_workspace():
             return 1
-        if not self._confirm_no_conflicting_jobs({"motor_read", "zero", "real_main", "real_joy", "real_imu"}):
+        if self.state.real_setup_requires_relogin:
+            error("dialout / udev の設定を反映した直後なので、先にログアウト / ログインしてください。")
+            bullet("再ログイン後に `実機前診断` を実行し、デバイス状態を再確認してください。")
+            return 1
+        if not self._confirm_no_conflicting_jobs(
+            {"motor_read", "zero", "real_main", "real_joy", "real_imu", "sim_main", "sim_joy"},
+            allow_override=False,
+        ):
             return 1
         self._sync_default_policy_state()
         selected_can_mode = self._select_can_mode(can_mode)
@@ -405,6 +460,11 @@ class MujinaAssistApp:
             error("serial CAN を使うには `slcand` が必要です。")
             bullet("Ubuntu 24.04 なら通常 `sudo apt install -y can-utils` で入ります。")
             return 1
+        policy_ready, policy_reason = self._active_policy_real_world_ready()
+        if not policy_ready:
+            error("現在の policy は provenance / 実機互換の確認が不足しています。")
+            bullet(policy_reason)
+            return 1
         if missing:
             self._report_missing_devices(
                 "実機起動に必要なデバイスが足りません。",
@@ -414,17 +474,20 @@ class MujinaAssistApp:
                 include_joy=True,
             )
             return 1
+        if not self._ensure_can_mode_ready(selected_can_mode):
+            return 1
         imu_port = self._resolve_runtime_imu_port()
         if imu_port is None:
             error("IMU ポートを確定できませんでした。")
             bullet("`/dev/rt_usb_imu` が無い場合は、IMU として使うポートを手動で絞り込んでください。")
             return 1
-        if not sim_policy_verified(self.state):
-            warn("今の policy はまだ SIM確認済みになっていません。")
-            bullet("まず同じ policy で SIM の姿勢と入力応答を確認することをおすすめします。")
-            if not ask_yes_no("それでも実機起動を続けますか？", default=False):
-                return 1
-        bullet("所定姿勢に置き、補助者が横についた状態で進めてください。")
+        if not report.sim_ready:
+            error("現在の workspace + policy では SIM確認済みの記録がありません。")
+            bullet("先に `SIM` を起動し、同じ条件で姿勢と入力応答を確認してから `SIM確認済み` を付けてください。")
+            return 1
+        if not self._confirm_real_robot_safety_checklist():
+            warn("実機起動前チェックを中止しました。")
+            return 1
         typed = ask_text("本当に実機を起動する場合だけ `REAL` と入力してください。")
         if typed != "REAL":
             warn("実機起動を中止しました。")
@@ -484,6 +547,12 @@ class MujinaAssistApp:
         else:
             candidate = candidates[selected]
         self._show_policy_summary(candidate)
+        if candidate.source_type in {"usb", "path"} and candidate.manifest_path is None:
+            warn("この policy には manifest が無く、学習元や robot revision の手掛かりが不足しています。")
+            bullet("実機投入前に、学習元 task・作成日時・対象 robot revision を別途確認してください。")
+            if not ask_yes_no("それでもこの policy を候補として扱いますか？", default=False):
+                warn("policy 切り替えを中止しました。")
+                return 1
         if not ask_yes_no("この policy に切り替えますか？", default=True):
             warn("policy 切り替えを中止しました。")
             return 1
@@ -528,6 +597,7 @@ class MujinaAssistApp:
 
     def handle_motor_read(self, ids: list[int] | None = None, can_mode: str = "auto") -> int:
         title("モータ確認")
+        self._sync_relogin_requirement()
         if not self._require_built_workspace():
             return 1
         if not self._confirm_no_conflicting_jobs({"motor_read", "zero"}):
@@ -545,6 +615,8 @@ class MujinaAssistApp:
                 include_joy=False,
             )
             return 1
+        if not self._ensure_can_mode_ready(selected_can_mode):
+            return 1
         target_ids = ids or self._ask_ids(default_to_all=True)
         if not target_ids:
             error("モータ ID が指定されていません。")
@@ -559,6 +631,9 @@ class MujinaAssistApp:
 
     def handle_motor_diagnostics(self, ids: list[int] | None = None, can_mode: str = "auto") -> int:
         title("モータ診断")
+        self._sync_relogin_requirement()
+        if not self._require_built_workspace():
+            return 1
         selected_can_mode = self._select_can_mode(can_mode)
         if selected_can_mode is None:
             return 1
@@ -572,6 +647,8 @@ class MujinaAssistApp:
                 include_imu=False,
                 include_joy=False,
             )
+            return 1
+        if not self._ensure_can_mode_ready(selected_can_mode):
             return 1
         script = build_motor_probe_script(self.paths, target_ids, selected_can_mode)
         log_path = self.paths.logs_dir / f"motor-diagnostics-{datetime.now().strftime('%Y%m%d-%H%M%S')}.log"
@@ -598,16 +675,19 @@ class MujinaAssistApp:
 
     def handle_robot_diagnostics(self, can_mode: str = "auto") -> int:
         title("ロボット診断")
-        self.handle_preflight(can_mode=can_mode)
+        preflight_result = self.handle_preflight(can_mode=can_mode)
+        if preflight_result != 0:
+            return preflight_result
         if ask_yes_no("続けて全モータの one-shot 診断も行いますか？", default=True):
             return self.handle_motor_diagnostics(can_mode=can_mode)
         return 0
 
     def handle_zero_position(self, ids: list[int] | None = None, can_mode: str = "auto") -> int:
         title("原点位置設定")
+        self._sync_relogin_requirement()
         if not self._require_built_workspace():
             return 1
-        if not self._confirm_no_conflicting_jobs({"motor_read", "zero", "real_main"}):
+        if not self._confirm_no_conflicting_jobs({"motor_read", "zero", "real_main"}, allow_override=False):
             return 1
         selected_can_mode = self._select_can_mode(can_mode)
         if selected_can_mode is None:
@@ -622,12 +702,15 @@ class MujinaAssistApp:
                 include_joy=False,
             )
             return 1
+        if not self._ensure_can_mode_ready(selected_can_mode):
+            return 1
         target_ids = ids or self._ask_ids(default_to_all=False)
         if not target_ids:
             error("対象のモータ ID が指定されていません。")
             return 1
-        bullet("README 記載の所定姿勢に置いてから実行してください。")
-        bullet("実際の書き込みは upstream の `motor_set_zero_position.py` をそのまま呼びます。")
+        if not self._confirm_zero_position_safety_checklist(target_ids):
+            warn("原点位置設定前チェックを中止しました。")
+            return 1
         confirmation_phrase = self._zero_confirmation_phrase(target_ids)
         typed = ask_text(f"本当に実行する場合だけ `{confirmation_phrase}` と入力してください。")
         if typed != confirmation_phrase:
@@ -662,108 +745,117 @@ class MujinaAssistApp:
             warn("まだログファイルがありません。")
             return 0
         section("ログ末尾")
-        lines = log_path.read_text(encoding="utf-8", errors="ignore").splitlines()
-        for line in lines[-40:]:
+        with log_path.open("r", encoding="utf-8", errors="ignore") as handle:
+            lines = deque(handle, maxlen=40)
+        for line in lines:
+            line = line.rstrip("\n")
             print(line)
         return 0
 
     def run_worker(self, job_file: Path) -> int:
         job = load_job(job_file)
-        if job.status in {"succeeded", "failed", "stopped"}:
-            print(f"[Mujina Assist] このジョブはすでに終了済みです: {job.name}")
+        claim_token = acquire_job_claim(job, ttl_seconds=6 * 3600)
+        if claim_token is None:
+            print(f"[Mujina Assist] このジョブは別 worker が処理中です: {job.name}")
             return 0
-        if job.status == "running":
-            print(f"[Mujina Assist] このジョブはすでに実行中です: {job.name}")
-            return 0
-        mark_job_running(job, terminal_mode=job.terminal_mode or "worker", terminal_label=job.terminal_label or "worker")
         try:
-            if job.kind == "setup":
-                returncode, message, stopped = self._execute_setup_job(job)
-            elif job.kind == "build":
-                returncode, message, stopped = self._execute_build_job(job)
-            elif job.kind == "viz":
-                returncode, message, stopped = self._execute_shell_job(
-                    job,
-                    build_viz_script(self.paths),
-                    "RViz を終了しました。",
-                    causes=["RViz 起動に必要な build が終わっていません。"],
-                    next_steps=["先に `ビルドする` を完了させてください。"],
-                    allow_sigint_stop=True,
-                )
-            elif job.kind == "sim_main":
-                returncode, message, stopped = self._execute_shell_job(
-                    job,
-                    build_sim_main_script(self.paths),
-                    "SIM 本体を終了しました。",
-                    causes=["build が終わっていません。", "依存関係が不足しています。"],
-                    next_steps=["`ビルドする` と `ONNX 読み込みテスト` を確認してください。"],
-                    allow_sigint_stop=True,
-                )
-            elif job.kind == "sim_joy":
-                returncode, message, stopped = self._execute_shell_job(
-                    job,
-                    build_joy_script(self.paths),
-                    "SIM joy ノードを終了しました。",
-                    causes=["joy ノードの依存関係が不足しています。"],
-                    next_steps=["`初回セットアップ` を確認してください。"],
-                    allow_sigint_stop=True,
-                )
-            elif job.kind == "real_imu":
-                imu_port = str(job.payload.get("imu_port", "/dev/rt_usb_imu"))
-                returncode, message, stopped = self._execute_shell_job(
-                    job,
-                    build_real_imu_script(self.paths, port_name=imu_port),
-                    "実機 IMU ノードを終了しました。",
-                    causes=["IMU ポート名が違います。", "IMU の配線や認識が不安定です。"],
-                    next_steps=["`ロボット診断` で IMU ポートを確認してください。"],
-                    allow_sigint_stop=True,
-                )
-            elif job.kind == "real_main":
-                can_mode = str(job.payload.get("can_mode", "net"))
-                returncode, message, stopped = self._execute_shell_job(
-                    job,
-                    build_real_main_script(self.paths, can_mode),
-                    "実機 mujina_main を終了しました。",
-                    causes=[
-                        "CAN モードの選択が違います。",
-                        "電源再投入後に can_setup が必要です。",
-                        "姿勢が所定位置からずれていて、実機開始直後に保護が入っています。",
-                    ],
-                    next_steps=[
-                        "まず所定姿勢に置き直してください。",
-                        "必要なら upstream 手順で can_setup をやり直してください。",
-                        "`モータ診断` で全軸の疎通を確認してください。",
-                    ],
-                    allow_sigint_stop=True,
-                )
-            elif job.kind == "real_joy":
-                returncode, message, stopped = self._execute_shell_job(
-                    job,
-                    build_joy_script(self.paths),
-                    "実機 joy ノードを終了しました。",
-                    causes=["ゲームパッドが認識されていません。"],
-                    next_steps=["`ロボット診断` で `/dev/input/js0` を確認してください。"],
-                    allow_sigint_stop=True,
-                )
-            elif job.kind == "policy_switch":
-                returncode, message, stopped = self._execute_policy_switch_job(job)
-            elif job.kind == "policy_test":
-                returncode, message, stopped = self._execute_policy_test_job(job)
-            elif job.kind == "motor_read":
-                returncode, message, stopped = self._execute_motor_read_job(job)
-            elif job.kind == "zero":
-                returncode, message, stopped = self._execute_zero_job(job)
+            job = load_job(job_file)
+            if job.status in {"succeeded", "failed", "stopped"}:
+                print(f"[Mujina Assist] このジョブはすでに終了済みです: {job.name}")
+                return 0
+            if job.status == "running":
+                print(f"[Mujina Assist] このジョブはすでに実行中です: {job.name}")
+                return 0
+            mark_job_running(job, terminal_mode=job.terminal_mode or "worker", terminal_label=job.terminal_label or "worker")
+            try:
+                if job.kind == "setup":
+                    returncode, message, stopped = self._execute_setup_job(job)
+                elif job.kind == "build":
+                    returncode, message, stopped = self._execute_build_job(job)
+                elif job.kind == "viz":
+                    returncode, message, stopped = self._execute_shell_job(
+                        job,
+                        build_viz_script(self.paths),
+                        "RViz を終了しました。",
+                        causes=["RViz 起動に必要な build が終わっていません。"],
+                        next_steps=["先に `ビルドする` を完了させてください。"],
+                        allow_sigint_stop=True,
+                    )
+                elif job.kind == "sim_main":
+                    returncode, message, stopped = self._execute_shell_job(
+                        job,
+                        build_sim_main_script(self.paths),
+                        "SIM 本体を終了しました。",
+                        causes=["build が終わっていません。", "依存関係が不足しています。"],
+                        next_steps=["`ビルドする` と `ONNX 読み込みテスト` を確認してください。"],
+                        allow_sigint_stop=True,
+                    )
+                elif job.kind == "sim_joy":
+                    returncode, message, stopped = self._execute_shell_job(
+                        job,
+                        build_joy_script(self.paths),
+                        "SIM joy ノードを終了しました。",
+                        causes=["joy ノードの依存関係が不足しています。"],
+                        next_steps=["`初回セットアップ` を確認してください。"],
+                        allow_sigint_stop=True,
+                    )
+                elif job.kind == "real_imu":
+                    imu_port = str(job.payload.get("imu_port", "/dev/rt_usb_imu"))
+                    returncode, message, stopped = self._execute_shell_job(
+                        job,
+                        build_real_imu_script(self.paths, port_name=imu_port),
+                        "実機 IMU ノードを終了しました。",
+                        causes=["IMU ポート名が違います。", "IMU の配線や認識が不安定です。"],
+                        next_steps=["`ロボット診断` で IMU ポートを確認してください。"],
+                        allow_sigint_stop=True,
+                    )
+                elif job.kind == "real_main":
+                    can_mode = str(job.payload.get("can_mode", "net"))
+                    returncode, message, stopped = self._execute_shell_job(
+                        job,
+                        build_real_main_script(self.paths, can_mode),
+                        "実機 mujina_main を終了しました。",
+                        causes=[
+                            "CAN モードの選択が違います。",
+                            "電源再投入後に can_setup が必要です。",
+                            "姿勢が所定位置からずれていて、実機開始直後に保護が入っています。",
+                        ],
+                        next_steps=[
+                            "まず所定姿勢に置き直してください。",
+                            "必要なら upstream 手順で can_setup をやり直してください。",
+                            "`モータ診断` で全軸の疎通を確認してください。",
+                        ],
+                        allow_sigint_stop=True,
+                    )
+                elif job.kind == "real_joy":
+                    returncode, message, stopped = self._execute_shell_job(
+                        job,
+                        build_joy_script(self.paths),
+                        "実機 joy ノードを終了しました。",
+                        causes=["ゲームパッドが認識されていません。"],
+                        next_steps=["`ロボット診断` で `/dev/input/js0` を確認してください。"],
+                        allow_sigint_stop=True,
+                    )
+                elif job.kind == "policy_switch":
+                    returncode, message, stopped = self._execute_policy_switch_job(job)
+                elif job.kind == "policy_test":
+                    returncode, message, stopped = self._execute_policy_test_job(job)
+                elif job.kind == "motor_read":
+                    returncode, message, stopped = self._execute_motor_read_job(job)
+                elif job.kind == "zero":
+                    returncode, message, stopped = self._execute_zero_job(job)
+                else:
+                    returncode, message, stopped = 1, f"未対応のジョブ種別です: {job.kind}", False
+            except Exception as exc:
+                traceback.print_exc()
+                returncode, message, stopped = 1, f"予期しない例外が発生しました: {exc}", False
+            if stopped:
+                mark_job_stopped(job, returncode=returncode, message=message)
             else:
-                returncode, message, stopped = 1, f"未対応のジョブ種別です: {job.kind}", False
-        except Exception as exc:
-            traceback.print_exc()
-            returncode, message, stopped = 1, f"予期しない例外が発生しました: {exc}", False
-
-        if stopped:
-            mark_job_stopped(job, returncode=returncode, message=message)
-        else:
-            mark_job_finished(job, returncode=returncode, message=message)
-        return returncode
+                mark_job_finished(job, returncode=returncode, message=message)
+            return returncode
+        finally:
+            release_job_claim(job, claim_token)
 
     def _execute_setup_job(self, job: JobRecord) -> tuple[int, str, bool]:
         log_path = job_log_path(job)
@@ -816,8 +908,10 @@ class MujinaAssistApp:
                     next_steps=["ログを確認して再試行してください。"],
                 )
                 return real.returncode, "実機用設定に失敗しました。", False
-            self.state.real_setup_requires_relogin = True
+            setup_status = real_setup_status()
+            self.state.real_setup_requires_relogin = not (setup_status.get("dialout") and setup_status.get("udev_rule"))
         capture_default_policy(self.paths)
+        self._clear_manual_recovery_state(kind="policy")
         self.state.last_action = "setup"
         self.state.active_policy_label = current_policy_label(self.paths, self.state)
         self._sync_default_policy_state()
@@ -836,6 +930,7 @@ class MujinaAssistApp:
             )
             return result.returncode, "ビルドに失敗しました。", False
         capture_default_policy(self.paths)
+        self._clear_manual_recovery_state(kind="policy")
         self._sync_default_policy_state()
         self.state.last_action = "build"
         self.save_state()
@@ -846,6 +941,8 @@ class MujinaAssistApp:
         ok, message = activate_policy(self.paths, self.state, candidate, job_log_path(job))
         self.save_state()
         if ok:
+            self._clear_manual_recovery_state(kind="policy")
+            self.save_state()
             success(message)
             return 0, message, False
         self._report_failure(
@@ -969,6 +1066,29 @@ class MujinaAssistApp:
             bullet(f"ログ予定先: {job.log_path}")
             return 1
         update_job(job, terminal_mode=launch.mode, terminal_label=launch.label, terminal_pid=launch.pid)
+        claimed = self._wait_for_worker_claim(job)
+        if claimed is None:
+            stop_error = stop_job_launch(mode=launch.mode, label=launch.label, pid=launch.pid)
+            if stop_error is None:
+                mark_job_finished(job, returncode=1, message="worker が起動確認タイムアウト内に開始しませんでした。")
+            else:
+                update_job(job, message=f"worker 起動を確認できませんでした。停止確認できませんでした: {stop_error}")
+                self._set_manual_recovery_state(
+                    kind="job_launch",
+                    summary=f"{job.name} の worker 起動を確認できず、停止確認もできませんでした。",
+                )
+                self.save_state()
+            error("ジョブの worker 起動を確認できませんでした。")
+            bullet(f"ログ: {job.log_path}")
+            return 1
+        if claimed.status == "failed":
+            error("ジョブは起動しましたが、直後に失敗しました。")
+            bullet(claimed.message or f"ログ: {job.log_path}")
+            return 1
+        if claimed.status == "stopped":
+            warn("ジョブは起動しましたが、直後に停止しました。")
+            bullet(claimed.message or f"ログ: {job.log_path}")
+            return 1
         success(launch.message)
         bullet(f"ログ: {job.log_path}")
         if launch.mode == "tmux":
@@ -976,7 +1096,8 @@ class MujinaAssistApp:
         return 0
 
     def _launch_job_group(self, jobs: list[JobRecord], *, heading: str) -> int:
-        launches: list[tuple[JobRecord, str, str]] = []
+        launches: list[tuple[JobRecord, str, str, int | None]] = []
+        manual_recovery_jobs: list[str] = []
         for job in jobs:
             launch = launch_job(self.paths, job)
             if not launch.ok:
@@ -984,22 +1105,69 @@ class MujinaAssistApp:
                 error("ジョブグループの起動途中で失敗しました。")
                 bullet(f"失敗したジョブ: {job.name}")
                 bullet(launch.message)
+                if launches:
+                    section("巻き戻し")
+                for launched_job, mode, label, pid in launches:
+                    stop_error = stop_job_launch(mode=mode, label=label, pid=pid)
+                    if stop_error is None:
+                        mark_job_stopped(launched_job, message="ジョブグループ起動失敗のため停止しました。")
+                        bullet(f"{launched_job.name} を停止しました。")
+                    else:
+                        update_job(launched_job, message=f"ジョブグループ起動失敗。停止確認できませんでした: {stop_error}")
+                        manual_recovery_jobs.append(launched_job.name)
+                        bullet(f"{launched_job.name} は停止確認できませんでした: {stop_error}")
+                if manual_recovery_jobs:
+                    self._set_manual_recovery_state(
+                        kind="job_launch",
+                        summary="ジョブグループ起動失敗後に停止確認できなかったジョブがあります: " + ", ".join(manual_recovery_jobs),
+                    )
+                    self.save_state()
                 return 1
             update_job(job, terminal_mode=launch.mode, terminal_label=launch.label, terminal_pid=launch.pid)
-            launches.append((job, launch.mode, launch.label))
+            claimed = self._wait_for_worker_claim(job)
+            if claimed is None or claimed.status in {"failed", "stopped"}:
+                failure_message = "worker 起動を確認できませんでした。" if claimed is None else (claimed.message or f"{job.name} は起動直後に失敗しました。")
+                mark_job_finished(job, returncode=1, message=failure_message)
+                error("ジョブグループの起動途中で失敗しました。")
+                bullet(f"失敗したジョブ: {job.name}")
+                bullet(failure_message)
+                rollback_targets = launches + [(job, launch.mode, launch.label, launch.pid)]
+                if rollback_targets:
+                    section("巻き戻し")
+                for launched_job, mode, label, pid in rollback_targets:
+                    stop_error = stop_job_launch(mode=mode, label=label, pid=pid)
+                    if stop_error is None:
+                        mark_job_stopped(launched_job, message="ジョブグループ起動失敗のため停止しました。")
+                        bullet(f"{launched_job.name} を停止しました。")
+                    else:
+                        update_job(launched_job, message=f"ジョブグループ起動失敗。停止確認できませんでした: {stop_error}")
+                        manual_recovery_jobs.append(launched_job.name)
+                        bullet(f"{launched_job.name} は停止確認できませんでした: {stop_error}")
+                if manual_recovery_jobs:
+                    self._set_manual_recovery_state(
+                        kind="job_launch",
+                        summary="ジョブグループ起動失敗後に停止確認できなかったジョブがあります: " + ", ".join(manual_recovery_jobs),
+                    )
+                    self.save_state()
+                return 1
+            launches.append((job, launch.mode, launch.label, launch.pid))
         success(heading)
-        for job, mode, label in launches:
+        for job, mode, label, _pid in launches:
             bullet(f"{job.name} | ログ: {job.log_path}")
             if mode == "tmux":
                 bullet(f"tmux attach -t {label}")
         return 0
 
-    def _confirm_no_conflicting_jobs(self, relevant_kinds: set[str]) -> bool:
+    def _confirm_no_conflicting_jobs(self, relevant_kinds: set[str], *, allow_override: bool = True) -> bool:
         conflicts = [job for job in active_jobs(self.paths) if job.kind in relevant_kinds]
         if conflicts:
             warn("同系統のジョブ記録が残っています。必要ならログで確認してください。")
             for job in conflicts:
                 bullet(f"{job.name} | ログ: {Path(job.log_path).name}")
+            if not allow_override:
+                section("次にやること")
+                bullet("先に実行中ジョブを停止し、ログで状態を確認してから再実行してください。")
+                return False
             return ask_yes_no("それでも続けますか？", default=True)
         return True
 
@@ -1095,6 +1263,21 @@ class MujinaAssistApp:
                 missing.append(item)
         return missing
 
+    def _ensure_can_mode_ready(self, can_mode: str) -> bool:
+        if can_mode != "net":
+            return True
+        can_status = inspect_can_status()
+        if not can_status.get("present", False):
+            return True
+        if can_status.get("ok", False):
+            return True
+        error("can0 は見えていますが、現在の状態は健全ではありません。")
+        operstate = str(can_status.get("operstate") or "unknown")
+        controller_state = str(can_status.get("controller_state") or "unknown")
+        bullet(f"operstate={operstate}, controller_state={controller_state}")
+        bullet("電源再投入後に公式の can_setup 手順をやり直してから再実行してください。")
+        return False
+
     def _report_missing_devices(
         self,
         summary: str,
@@ -1116,6 +1299,42 @@ class MujinaAssistApp:
             bullet("network CAN を使うなら、電源再投入後に公式の can_setup 手順をやり直してください。")
         if can_mode == "serial" and "/dev/usb_can" in missing:
             bullet("serial CAN を使うなら `/dev/usb_can` が出ているか、または udev ルールを確認してください。")
+
+    def _confirm_real_robot_safety_checklist(self) -> bool:
+        section("実機起動前チェック")
+        bullet("所定姿勢に置き、周囲 50cm 以上の離隔を確保してください。")
+        bullet("補助者が横につき、独立した停止手段をすぐ使える状態にしてください。")
+        bullet("gamepad は Logicool F710 / F310 の X mode、MODE LED OFF を前提にしてください。")
+        bullet("選ぶ policy の由来と学習条件を把握したうえで進めてください。")
+        prompts = [
+            "周囲の離隔、補助者、停止手段を確認しましたか？",
+            "gamepad の X mode と MODE LED OFF を確認しましたか？",
+            "今の policy の由来と学習条件を把握していますか？",
+        ]
+        return all(ask_yes_no(prompt, default=False) for prompt in prompts)
+
+    def _confirm_zero_position_safety_checklist(self, ids: list[int]) -> bool:
+        section("原点位置設定前チェック")
+        bullet("README 記載の所定姿勢に置いてから実行してください。")
+        bullet("実際の書き込みは upstream の `motor_set_zero_position.py` をそのまま呼びます。")
+        bullet("対象 ID: " + " ".join(str(value) for value in ids))
+        prompts = [
+            "所定姿勢と対象 ID を確認しましたか？",
+            "周囲の離隔と停止手段を確認しましたか？",
+        ]
+        return all(ask_yes_no(prompt, default=False) for prompt in prompts)
+
+    def _wait_for_worker_claim(self, job: JobRecord) -> JobRecord | None:
+        deadline = time.monotonic() + WORKER_CLAIM_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            try:
+                current = load_job(Path(job.job_file))
+            except Exception:
+                return None
+            if current.status != "queued" or current.started_at or current.finished_at:
+                return current
+            time.sleep(WORKER_CLAIM_POLL_SECONDS)
+        return None
 
     def _resolve_runtime_imu_port(self) -> str | None:
         port, fallback, candidates = resolve_imu_port()
@@ -1144,6 +1363,11 @@ class MujinaAssistApp:
             error("現在の policy のハッシュを取得できませんでした。")
             bullet("先に `ビルドする` か `policy を切り替える` を確認してください。")
             return 1
+        current_workspace_signature = self._current_workspace_signature()
+        if not self._has_live_sim_session(self.state.active_policy_hash, current_workspace_signature):
+            error("今の policy / workspace に対応する実行中の SIM セッションを確認できません。")
+            bullet("先に `SIM` を起動し、別ターミナルで姿勢と入力応答を確認してから再度実行してください。")
+            return 1
         if ask_confirmation and not ask_yes_no("今の policy で SIM の確認を完了しましたか？", default=False):
             warn("SIM確認済みの記録を中止しました。")
             return 1
@@ -1153,9 +1377,44 @@ class MujinaAssistApp:
         self.state.last_sim_verified_at = datetime.now().astimezone().isoformat(timespec="seconds")
         self.state.last_sim_verified_label = self.state.active_policy_label
         self.state.last_sim_verified_source = self.state.active_policy_source
+        self.state.last_sim_verified_workspace_signature = current_workspace_signature
         self.save_state()
         success("今の policy を SIM確認済みとして記録しました。")
         return 0
+
+    def _has_live_sim_session(self, policy_hash: str, workspace_signature_value: str) -> bool:
+        groups: dict[str, set[str]] = {}
+        for job in active_jobs(self.paths):
+            if job.kind not in {"sim_main", "sim_joy"}:
+                continue
+            if str(job.payload.get("policy_hash", "")) != policy_hash:
+                continue
+            if str(job.payload.get("workspace_signature", "")) != workspace_signature_value:
+                continue
+            if not job.group_id or not job.started_at:
+                continue
+            groups.setdefault(job.group_id, set()).add(job.kind)
+        return any(kinds == {"sim_main", "sim_joy"} for kinds in groups.values())
+
+    def _current_active_policy_candidate(self) -> PolicyCandidate | None:
+        if not self.state.active_policy_hash:
+            return None
+        for candidate in all_policy_candidates(self.paths, self.state):
+            if candidate.policy_hash and candidate.policy_hash == self.state.active_policy_hash:
+                return candidate
+        return None
+
+    def _active_policy_real_world_ready(self) -> tuple[bool, str]:
+        candidate = self._current_active_policy_candidate()
+        if candidate is None:
+            if current_policy_label(self.paths, self.state) == "公式デフォルト" and self.paths.source_policy_path.exists():
+                return True, ""
+            return False, "現在の policy の由来をキャッシュから特定できません。切り替え直して provenance を確定してください。"
+        if candidate.source_type == "default":
+            return True, ""
+        if candidate.manifest_path is None or not candidate.manifest_path.exists():
+            return False, "manifest が無く、robot revision や学習条件を検証できません。manifest 付き policy を使ってください。"
+        return True, ""
 
     def _ask_ids(self, *, default_to_all: bool = False) -> list[int]:
         prompt = "対象のモータ ID を空白またはカンマ区切りで入力してください。"
@@ -1226,12 +1485,13 @@ class MujinaAssistApp:
             return candidate
         cached_path = import_policy_to_cache(self.paths, candidate)
         cleanup_policy_cache(self.paths, self.state)
+        cached_manifest = cached_path.with_suffix(".manifest.json")
         return PolicyCandidate(
             label=candidate.label,
             path=cached_path,
             source_type="cache",
             description=candidate.description,
-            manifest_path=None,
+            manifest_path=cached_manifest if cached_manifest.exists() else None,
             policy_hash=candidate.policy_hash,
             size_bytes=candidate.size_bytes,
             last_used_at=candidate.last_used_at,
@@ -1267,6 +1527,7 @@ class MujinaAssistApp:
         section("選んだ policy")
         bullet(f"名前: {candidate.label}")
         bullet(f"場所: {candidate.path}")
+        bullet(f"manifest: {candidate.manifest_path if candidate.manifest_path else 'なし'}")
         if candidate.description:
             bullet(f"説明: {candidate.description}")
         if candidate.policy_hash:

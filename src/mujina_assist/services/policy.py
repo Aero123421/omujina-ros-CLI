@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import sys
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,13 +26,21 @@ def _load_policy_index(paths: AppPaths) -> dict:
         return {"entries": []}
     try:
         return json.loads(paths.policy_index_file.read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as exc:
+        print(f"[Mujina Assist] policy index の読み込みに失敗しました: {paths.policy_index_file} ({exc})", file=sys.stderr)
         return {"entries": []}
 
 
 def _save_policy_index(paths: AppPaths, data: dict) -> None:
     paths.policy_index_file.parent.mkdir(parents=True, exist_ok=True)
-    paths.policy_index_file.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    payload = json.dumps(data, indent=2, ensure_ascii=False)
+    target = paths.policy_index_file
+    temp_path = target.with_suffix(target.suffix + ".tmp")
+    backup_path = target.with_suffix(target.suffix + ".bak")
+    if target.exists():
+        shutil.copy2(target, backup_path)
+    temp_path.write_text(payload, encoding="utf-8")
+    temp_path.replace(target)
 
 
 def _entries_from_index(paths: AppPaths) -> list[PolicyCacheEntry]:
@@ -251,6 +260,14 @@ def activate_policy(paths: AppPaths, state: RuntimeState, candidate: PolicyCandi
         rollback_ok = _restore_previous_policy(paths, previous_policy, state, previous_label, previous_source, previous_hash, log_path)
         suffix = "" if rollback_ok else " さらに元の policy への復旧にも失敗しています。"
         _append_policy_history(paths, {"timestamp": _timestamp(), "event": "switch_failed", "label": candidate.label, "result": "build_failed"})
+        if rollback_ok:
+            state.manual_recovery_required = False
+            state.manual_recovery_kind = ""
+            state.manual_recovery_summary = ""
+        else:
+            state.manual_recovery_required = True
+            state.manual_recovery_kind = "policy"
+            state.manual_recovery_summary = "policy 切替失敗後の復旧ビルドにも失敗しました。workspace と policy の整合性を手動で確認してください。"
         return False, f"policy 切り替え後のビルドに失敗しました。{suffix}"
 
     test_result = run_onnx_self_test(paths, log_path)
@@ -258,6 +275,14 @@ def activate_policy(paths: AppPaths, state: RuntimeState, candidate: PolicyCandi
         rollback_ok = _restore_previous_policy(paths, previous_policy, state, previous_label, previous_source, previous_hash, log_path)
         suffix = "" if rollback_ok else " さらに元の policy への復旧にも失敗しています。"
         _append_policy_history(paths, {"timestamp": _timestamp(), "event": "switch_failed", "label": candidate.label, "result": "onnx_test_failed"})
+        if rollback_ok:
+            state.manual_recovery_required = False
+            state.manual_recovery_kind = ""
+            state.manual_recovery_summary = ""
+        else:
+            state.manual_recovery_required = True
+            state.manual_recovery_kind = "policy"
+            state.manual_recovery_summary = "policy 読み込みテスト失敗後の復旧ビルドにも失敗しました。workspace と policy の整合性を手動で確認してください。"
         return False, f"ONNX 読み込みテストに失敗しました。{suffix}"
 
     active_hash = file_hash(paths.source_policy_path)
@@ -265,11 +290,15 @@ def activate_policy(paths: AppPaths, state: RuntimeState, candidate: PolicyCandi
     state.active_policy_source = str(cached_source)
     state.active_policy_hash = active_hash
     state.last_action = "policy_switch"
+    state.manual_recovery_required = False
+    state.manual_recovery_kind = ""
+    state.manual_recovery_summary = ""
     state.last_sim_success = False
     state.last_sim_policy_hash = ""
     state.last_sim_verified_at = ""
     state.last_sim_verified_label = ""
     state.last_sim_verified_source = ""
+    state.last_sim_verified_workspace_signature = ""
     _touch_cache_entry(paths, active_hash)
     cleanup_policy_cache(paths, state)
     _append_policy_history(
@@ -308,10 +337,12 @@ def _restore_previous_policy(
         run_rosdep_step=False,
         install_python_deps=False,
     )
-    state.active_policy_label = previous_label
-    state.active_policy_source = previous_source
-    state.active_policy_hash = previous_hash
-    return rollback.returncode == 0
+    if rollback.returncode == 0:
+        state.active_policy_label = previous_label
+        state.active_policy_source = previous_source
+        state.active_policy_hash = previous_hash
+        return True
+    return False
 
 
 def _touch_cache_entry(paths: AppPaths, policy_hash: str) -> None:

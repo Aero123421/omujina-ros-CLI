@@ -8,7 +8,11 @@ from mujina_assist.services.workspace import ros_prefix
 
 
 def _can_setup_command(can_mode: str) -> str:
-    return "./mujina_control/scripts/can_setup_serial.sh" if can_mode == "serial" else "./mujina_control/scripts/can_setup_net.sh"
+    if can_mode == "serial":
+        return "./mujina_control/scripts/can_setup_serial.sh"
+    if can_mode == "net":
+        return "./mujina_control/scripts/can_setup_net.sh"
+    raise ValueError(f"Invalid can_mode: {can_mode!r}. Expected 'serial' or 'net'.")
 
 
 def _workspace_command(paths: AppPaths, *commands: str) -> str:
@@ -56,11 +60,12 @@ def build_joy_script(paths: AppPaths) -> str:
 
 
 def build_real_imu_script(paths: AppPaths, port_name: str = "/dev/rt_usb_imu") -> str:
+    port_parameter = shell_quote(f"port_name:={port_name}")
     return " && ".join(
         [
             ros_prefix(paths),
             f"cd {shell_quote(paths.workspace_dir)}",
-            f'ros2 run rt_usb_imu_driver rt_usb_imu_driver --ros-args -p "port_name:={port_name}"',
+            f"ros2 run rt_usb_imu_driver rt_usb_imu_driver --ros-args -p {port_parameter}",
         ]
     )
 

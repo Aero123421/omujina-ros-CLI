@@ -57,6 +57,83 @@ class PolicyTest(unittest.TestCase):
             self.assertEqual(source_policy.read_bytes(), b"default")
             self.assertEqual(state.active_policy_label, "公式デフォルト")
 
+    def test_activate_policy_clears_stale_manual_recovery_when_rollback_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            paths = AppPaths.from_repo_root(repo_root)
+            paths.ensure_directories()
+            paths.upstream_dir.mkdir(parents=True, exist_ok=True)
+            source_policy = paths.source_policy_path
+            source_policy.parent.mkdir(parents=True, exist_ok=True)
+            source_policy.write_bytes(b"default")
+            paths.default_policy_cache.write_bytes(b"default")
+
+            incoming = repo_root / "new.onnx"
+            incoming.write_bytes(b"broken")
+            candidate = PolicyCandidate(label="USB: new.onnx", path=incoming, source_type="usb")
+            state = RuntimeState(
+                active_policy_label="公式デフォルト",
+                active_policy_source=str(paths.default_policy_cache),
+                active_policy_hash="abc",
+                manual_recovery_required=True,
+                manual_recovery_summary="old",
+            )
+            with patch(
+                "mujina_assist.services.policy.run_workspace_build_with_options",
+                side_effect=[
+                    CommandResult(command="build", returncode=1),
+                    CommandResult(command="rollback", returncode=0),
+                ],
+            ), patch(
+                "mujina_assist.services.policy.run_onnx_self_test",
+                return_value=CommandResult(command="onnx", returncode=0),
+            ):
+                ok, _message = activate_policy(paths, state, candidate, repo_root / "policy.log")
+
+            self.assertFalse(ok)
+            self.assertFalse(state.manual_recovery_required)
+            self.assertEqual(state.manual_recovery_kind, "")
+            self.assertEqual(state.manual_recovery_summary, "")
+
+    def test_activate_policy_marks_manual_recovery_when_rollback_also_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            paths = AppPaths.from_repo_root(repo_root)
+            paths.ensure_directories()
+            paths.upstream_dir.mkdir(parents=True, exist_ok=True)
+            source_policy = paths.source_policy_path
+            source_policy.parent.mkdir(parents=True, exist_ok=True)
+            source_policy.write_bytes(b"default")
+            paths.default_policy_cache.write_bytes(b"default")
+
+            incoming = repo_root / "new.onnx"
+            incoming.write_bytes(b"broken")
+            candidate = PolicyCandidate(label="USB: new.onnx", path=incoming, source_type="usb")
+            state = RuntimeState(
+                active_policy_label="公式デフォルト",
+                active_policy_source=str(paths.default_policy_cache),
+                active_policy_hash="abc",
+            )
+            with patch(
+                "mujina_assist.services.policy.run_workspace_build_with_options",
+                side_effect=[
+                    CommandResult(command="build", returncode=1),
+                    CommandResult(command="rollback", returncode=1),
+                ],
+            ), patch(
+                "mujina_assist.services.policy.run_onnx_self_test",
+                return_value=CommandResult(command="onnx", returncode=0),
+            ):
+                ok, message = activate_policy(paths, state, candidate, repo_root / "policy.log")
+
+            self.assertFalse(ok)
+            self.assertIn("復旧", message)
+            self.assertTrue(state.manual_recovery_required)
+            self.assertEqual(state.manual_recovery_kind, "policy")
+            self.assertIn("手動で確認", state.manual_recovery_summary)
+            self.assertEqual(source_policy.read_bytes(), b"default")
+            self.assertEqual(state.active_policy_label, "公式デフォルト")
+
     def test_cleanup_policy_cache_preserves_active_and_sim_verified_entries(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)

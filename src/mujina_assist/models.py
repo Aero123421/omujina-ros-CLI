@@ -84,7 +84,11 @@ class RuntimeState:
     last_sim_verified_at: str = ""
     last_sim_verified_label: str = ""
     last_sim_verified_source: str = ""
+    last_sim_verified_workspace_signature: str = ""
     real_setup_requires_relogin: bool = False
+    manual_recovery_required: bool = False
+    manual_recovery_kind: str = ""
+    manual_recovery_summary: str = ""
     tmux_session_name: str = ""
 
 

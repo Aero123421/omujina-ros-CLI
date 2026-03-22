@@ -6,6 +6,8 @@ from pathlib import Path
 
 from mujina_assist.models import AppPaths
 from mujina_assist.services.processes import (
+    build_real_imu_script,
+    build_real_main_script,
     build_motor_probe_script,
     build_motor_read_script,
     build_zero_script,
@@ -42,6 +44,19 @@ class ProcessScriptTest(unittest.TestCase):
             self.assertIn("--device can0", script)
             self.assertIn("--ids 4", script)
             self.assertNotIn("can_setup_serial.sh", script)
+
+    def test_build_real_main_script_rejects_invalid_can_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths.from_repo_root(Path(tmp))
+            with self.assertRaises(ValueError):
+                build_real_main_script(paths, "invalid")
+
+    def test_build_real_imu_script_quotes_port_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths.from_repo_root(Path(tmp))
+            script = build_real_imu_script(paths, "/tmp/rt usb imu")
+
+            self.assertIn("-p 'port_name:=/tmp/rt usb imu'", script)
 
 
 if __name__ == "__main__":

@@ -115,6 +115,45 @@ class ChecksTest(unittest.TestCase):
             self.assertEqual(imu_check.status, "warn")
             self.assertIn("代替ポート", "\n".join(imu_check.details))
 
+    def test_doctor_report_notes_relogin_and_gamepad_mode_reminder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths.from_repo_root(Path(tmp))
+            paths.ensure_directories()
+            state = RuntimeState(real_setup_requires_relogin=True)
+            with patch(
+                "mujina_assist.services.checks.read_os_release",
+                return_value={"VERSION_ID": "24.04", "PRETTY_NAME": "Ubuntu 24.04"},
+            ), patch(
+                "mujina_assist.services.checks.detect_real_devices",
+                return_value={
+                    "/dev/rt_usb_imu": True,
+                    "/dev/usb_can": True,
+                    "can0": False,
+                    "/dev/input/js0": True,
+                },
+            ), patch(
+                "mujina_assist.services.checks.real_setup_status",
+                return_value={"dialout": True, "udev_rule": True},
+            ), patch(
+                "mujina_assist.services.checks.resolve_imu_port",
+                return_value=("/dev/rt_usb_imu", False, []),
+            ), patch(
+                "mujina_assist.services.checks.command_exists",
+                return_value=True,
+            ), patch(
+                "mujina_assist.services.checks.graphical_terminal_available",
+                return_value=True,
+            ), patch(
+                "mujina_assist.services.checks.inspect_can_status",
+                return_value={"present": True, "operstate": "up", "controller_state": "error-active", "txqueuelen": 10, "raw": "", "ok": True, "warn": False},
+            ):
+                report = build_doctor_report(paths, state)
+
+            joined = "\n".join(report.notes)
+            self.assertIn("ログアウト / ログイン", joined)
+            self.assertIn("MODE LED OFF", joined)
+            self.assertIn("再ログイン", report.recommendation)
+
 
 if __name__ == "__main__":
     unittest.main()

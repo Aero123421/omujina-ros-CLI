@@ -45,7 +45,42 @@ def current_policy_label(paths: AppPaths, state: RuntimeState) -> str:
 
 
 def sim_policy_verified(state: RuntimeState) -> bool:
-    return bool(state.last_sim_success and state.last_sim_policy_hash and state.last_sim_policy_hash == state.active_policy_hash)
+    return bool(
+        state.last_sim_success
+        and state.last_sim_policy_hash
+        and state.last_sim_policy_hash == state.active_policy_hash
+    )
+
+
+def workspace_signature(paths: AppPaths) -> str:
+    if not workspace_clone_ready(paths) or not command_exists("git"):
+        return ""
+    try:
+        revision = subprocess.run(
+            ["git", "-C", str(paths.upstream_dir), "rev-parse", "HEAD"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except Exception:
+        return ""
+    if revision.returncode != 0:
+        return ""
+    signature = (revision.stdout or "").strip()
+    if not signature:
+        return ""
+    try:
+        dirty = subprocess.run(
+            ["git", "-C", str(paths.upstream_dir), "status", "--porcelain"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except Exception:
+        return signature
+    if dirty.returncode == 0 and (dirty.stdout or "").strip():
+        return f"{signature}-dirty"
+    return signature
 
 
 def detect_real_devices() -> dict[str, bool]:
@@ -191,6 +226,8 @@ def build_doctor_report(paths: AppPaths, state: RuntimeState) -> DoctorReport:
     can_status = inspect_can_status()
 
     active_policy_hash = file_hash(paths.source_policy_path) if paths.source_policy_path.exists() else ""
+    current_workspace_signature = workspace_signature(paths)
+    sim_ready = sim_policy_verified(state) and state.last_sim_verified_workspace_signature == current_workspace_signature
     active_policy_label = current_policy_label(paths, state)
     active_policy_source = state.active_policy_source
     if not active_policy_source and paths.source_policy_path.exists():
@@ -232,8 +269,8 @@ def build_doctor_report(paths: AppPaths, state: RuntimeState) -> DoctorReport:
         DoctorCheck(
             "sim",
             "SIM確認",
-            "ok" if sim_policy_verified(state) else "warn",
-            "確認済み" if sim_policy_verified(state) else "未確認",
+            "ok" if sim_ready else "warn",
+            "確認済み" if sim_ready else "未確認",
         ),
         DoctorCheck(
             "imu",
@@ -263,19 +300,28 @@ def build_doctor_report(paths: AppPaths, state: RuntimeState) -> DoctorReport:
     ]
 
     notes: list[str] = []
+    if state.real_setup_requires_relogin:
+        notes.append("dialout / udev の設定を反映した直後です。いったんログアウト / ログインしてから実機前診断をやり直してください。")
     if not sim_policy_verified(state):
         notes.append("現在の policy はまだ SIM 確認済みとして記録されていません。")
+    elif current_workspace_signature and state.last_sim_verified_workspace_signature != current_workspace_signature:
+        notes.append("SIM確認済みの記録はありますが、その後 workspace の revision が変わっています。再度 SIM 確認が必要です。")
     if imu_fallback and imu_port:
         notes.append(f"IMU は固定名ではなく代替ポート {imu_port} を使う見込みです。")
     if serial_candidates and (not devices.get("/dev/usb_can", False) or not devices.get("/dev/rt_usb_imu", False)):
         notes.append("汎用 USB シリアル候補は見えています。固定名デバイスが出ない場合は udev ルールと VID/PID を確認してください。")
     if can_status["present"] and not can_status["ok"]:
         notes.append("can0 は見えていますが、現在の状態は健全ではありません。電源再投入後は公式の can_setup 手順をやり直してください。")
+    if devices.get("/dev/input/js0", False):
+        notes.append("gamepad の認識だけでは不十分です。Logicool F710 / F310 の X mode、MODE LED OFF を確認してください。")
 
     recommendation = "まず `保守・診断` で不足項目を潰してから進めてください。"
-    if (
+    if state.real_setup_requires_relogin:
+        recommendation = "実機用設定を反映した直後です。まず再ログインしてから `実機前診断` をやり直してください。"
+    elif (
         workspace_built
-        and sim_policy_verified(state)
+        and sim_ready
+        and state.last_sim_verified_workspace_signature == current_workspace_signature
         and devices.get("/dev/input/js0", False)
         and imu_port
         and not imu_fallback
@@ -299,7 +345,7 @@ def build_doctor_report(paths: AppPaths, state: RuntimeState) -> DoctorReport:
         active_policy_source=active_policy_source,
         active_policy_hash=active_policy_hash,
         usb_policy_count=count_usb_policies(),
-        sim_ready=sim_policy_verified(state),
+        sim_ready=sim_ready,
         sim_verified_at=state.last_sim_verified_at,
         real_devices=devices,
         serial_candidates=serial_candidates,

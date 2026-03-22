@@ -16,7 +16,7 @@ Ubuntu 24.04 のターミナルで次を実行します。
 
 ```bash
 git clone <this-repository>
-cd ros-mujina-project
+cd <cloned-directory>
 ./start.sh
 ```
 
@@ -82,4 +82,23 @@ CLI を直接呼ぶ形は開発者向けのため、通常利用では `./start.
 
 このリポジトリ自体は `mujina_ros` を含みません。実行時に `workspace/src/mujina_ros` へ clone します。
 
-VirtualBox で Ubuntu 24.04 VM を用意し、その中で `./start.sh` を実行して確認する想定です。
+ローカルの軽量確認:
+
+```bash
+pytest -q
+```
+
+コンテナ経由の確認:
+
+```bash
+./scripts/run-docker-tests.sh
+```
+
+この smoke test はコンテナ内で `python -m unittest discover -s tests -t .` を実行し、worker の終了コード契約も合わせて検証します。
+`scripts/run-container-tests.sh` は Dockerfile.test から呼ばれるコンテナ専用入口で、ローカル直接実行は想定していません。
+
+実機前の手順確認:
+
+- VirtualBox などで Ubuntu 24.04 VM を用意して `./start.sh` を通す
+- hardware / firmware 前提は `Mujina_Hardware` と upstream README を参照する
+- `dialout` / `udev` 反映後は一度ログアウト / ログインしてから再確認する
